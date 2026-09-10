@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  chatery:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: chatery-whatsapp-api
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - CORS_ORIGIN=${CORS_ORIGIN:-*}
+      - DASHBOARD_USERNAME=${DASHBOARD_USERNAME:-admin}
+      - DASHBOARD_PASSWORD=${DASHBOARD_PASSWORD:-admin123}
+      - API_KEY=${API_KEY:-}
+    volumes:
+      # Persist WhatsApp sessions
+      - chatery_sessions:/app/sessions
+      # Persist received media files
+      - chatery_media:/app/public/media
+      # Persist message store
+      - chatery_store:/app/store
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - chatery-network
+
+volumes:
+  chatery_sessions:
+    driver: local
+  chatery_media:
+    driver: local
+  chatery_store:
+    driver: local
+
+networks:
+  chatery-network:
+    driver: bridge

@@ -1,0 +1,38 @@
+{
+  "url": "http://127.0.0.1:8081/",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "WA Gateway",
+      "hasCanvas": false,
+      "bodyTextLen": 1239,
+      "bodyTextHash": "c8cade61fb232038402fd633b2b5d5981187cefcb99b2e7465b9e249427b1155",
+      "bodyTextPrefix": "WA WA Gateway Multi-account Control Center Search messages, cont",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-built.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "WA Gateway",
+      "hasCanvas": false,
+      "bodyTextLen": 512,
+      "bodyTextHash": "5fb1236a32c0f8f68ce07c997778d3981e02bbc6a845f0dbfc2ce645d55e765e",
+      "bodyTextPrefix": "WA WA Gateway S All Chats ▾ All 12 Unread 3 Groups 8 Rohan Mehta",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-built-mobile.png"
+    }
+  },
+  "brandWarnings": [],
+  "authWarnings": [],
+  "verdictFile": "/workspace/screenshots/app-builder-built.json",
+  "divergesFromBaseline": false,
+  "baselineReasons": []
+}

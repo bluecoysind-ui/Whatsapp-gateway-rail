@@ -1,0 +1,104 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --color-ink: #e8eaf4;
+  --color-muted: #9aa3c0;
+  --color-dim: #6d7594;
+  --color-night: #080614;
+  --color-panel: rgba(16, 14, 42, 0.62);
+  --color-panel-2: rgba(20, 18, 52, 0.72);
+  --color-glass: rgba(255, 255, 255, 0.06);
+  --color-line: rgba(255, 255, 255, 0.08);
+  --color-wa: #25d366;
+  --color-wa-deep: #128c7e;
+  --color-indigo: #6366f1;
+  --color-violet: #8b5cf6;
+  --color-danger: #f87171;
+  --color-bubble-in: rgba(42, 38, 72, 0.92);
+  --radius-xl: 1.25rem;
+  --shadow-glass: 0 8px 40px rgba(8, 4, 28, 0.45);
+}
+
+@layer base {
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+
+  html,
+  body,
+  #app {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    font-family: var(--font-sans);
+    color: var(--color-ink);
+    background: #080614;
+    overflow: hidden;
+  }
+
+  img {
+    outline: 1px solid rgba(255, 255, 255, 0.1);
+    outline-offset: -1px;
+  }
+}
+
+.app-bg {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  background:
+    radial-gradient(ellipse 70% 50% at 80% 0%, rgba(110, 50, 210, 0.35), transparent 55%),
+    radial-gradient(ellipse 50% 40% at 10% 100%, rgba(40, 20, 90, 0.45), transparent 50%),
+    linear-gradient(180deg, #120a28 0%, #0a0618 48%, #150b2c 100%);
+}
+
+.glass {
+  background: linear-gradient(180deg, rgba(28, 24, 68, 0.55), rgba(14, 12, 40, 0.5));
+  backdrop-filter: blur(28px) saturate(1.4);
+  -webkit-backdrop-filter: blur(28px) saturate(1.4);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 0 0 1px rgba(255, 255, 255, 0.06),
+    var(--shadow-glass);
+}
+
+.glass-soft {
+  background: rgba(18, 14, 46, 0.45);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 0 0 1px rgba(255, 255, 255, 0.05);
+}
+
+.chat-wallpaper {
+  background-image:
+    radial-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+    radial-gradient(circle at 12% 18%, rgba(99, 102, 241, 0.07), transparent 28%),
+    radial-gradient(circle at 88% 80%, rgba(37, 211, 102, 0.05), transparent 26%);
+  background-size: 22px 22px, auto, auto;
+}
+
+.scroll-thin::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.scroll-thin::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 99px;
+}
+
+.scroll-thin {
+  scrollbar-color: rgba(255, 255, 255, 0.12) transparent;
+  scrollbar-width: thin;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+  }
+}

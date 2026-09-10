@@ -1,0 +1,35 @@
+{
+  "name": "chatery_whatsapp",
+  "version": "1.2.0",
+  "description": "Backend for chatery.app",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/farinchan/chatery_whatsapp.git"
+  },
+  "keywords": [
+    "chatery"
+  ],
+  "author": "Fajri Rinaldi Chan",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/farinchan/chatery_whatsapp/issues"
+  },
+  "homepage": "https://github.com/farinchan/chatery_whatsapp#readme",
+  "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc.9",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "pino": "^10.1.0",
+    "qrcode": "^1.5.4",
+    "socket.io": "^4.8.1",
+    "swagger-jsdoc": "^6.2.8",
+    "swagger-ui-express": "^5.0.1"
+  }
+}
