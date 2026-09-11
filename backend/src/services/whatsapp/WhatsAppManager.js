@@ -61,7 +61,7 @@ class WhatsAppManager {
             const existingSession = this.sessions.get(sessionId);
             
             // Update config if provided
-            if (options.metadata || options.webhooks) {
+            if (options.metadata || options.webhooks || options.proxy !== undefined) {
                 existingSession.updateConfig(options);
             }
             

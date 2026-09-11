@@ -159,6 +159,14 @@ DASHBOARD_PASSWORD=securepassword123
 
 # API Key Authentication (optional - leave empty or 'your_api_key_here' to disable)
 API_KEY=your_secret_api_key_here
+
+# Proxy check target for POST /proxy/test (must return the caller's IP; JSON {"ip":...} or plain text)
+PROXY_CHECK_URL=https://api.ipify.org?format=json
+PROXY_CHECK_TIMEOUT_MS=15000
+
+# Bulk messaging limits
+BULK_MAX_RECIPIENTS=100
+BULK_RECONNECT_WAIT_MS=60000
 ```
 
 > **Note:** Personal chat IDs use `@c.us` format (e.g., `628123456789@c.us`). Group IDs use `@g.us` format. Phone numbers are automatically normalized (0 → 62).
@@ -370,24 +378,70 @@ PATCH /sessions/:sessionId/config
   "metadata": { "newField": "value" },
   "webhooks": [
     { "url": "https://new-webhook.com/endpoint", "events": ["message", "connection.update"] }
-  ]
+  ],
+  "proxy": "socks5://user:pass@proxy.example.com:1080",
+  "reconnect": true
 }
 ```
+
+All fields are optional; only the ones present are changed. `proxy` accepts a URL or `null` to remove it (see [Per-session proxy](#per-session-proxy)).
 
 **Response:**
 ```json
 {
   "success": true,
-  "message": "Session config updated",
+  "message": "Proxy saved — reconnecting the session through it",
   "data": {
     "sessionId": "mysession",
     "metadata": { "userId": "user123", "newField": "value" },
     "webhooks": [
       { "url": "https://new-webhook.com/endpoint", "events": ["message", "connection.update"] }
-    ]
+    ],
+    "proxy": "socks5://user:***@proxy.example.com:1080",
+    "proxyApplied": true
   }
 }
 ```
+
+#### Per-session proxy
+
+Each session can connect through its own proxy, so every linked number can have its own egress IP. The proxy carries **both** the WhatsApp WebSocket and media uploads/downloads, and it is stored in the session's `config.json`, so it survives restarts.
+
+Supported URLs: `socks5://[user:pass@]host:port` (also `socks4://`, `socks5h://`) and `http://[user:pass@]host:port` (HTTP CONNECT; `https://` for a TLS proxy). The password is masked as `***` in every API response.
+
+- Set it when creating the session — `POST /sessions/:id/connect` with `{ "proxy": "..." }` — or later with `PATCH /sessions/:id/config`.
+- Changing the proxy on a live session restarts its socket through the new proxy immediately (a few seconds offline, no new QR for a paired session). Pass `"reconnect": false` to only save it for the next connect; the response's `proxyApplied` tells you which happened.
+- `GET /sessions` and `GET /sessions/:id/status` include the (masked) `proxy`.
+- An invalid URL is rejected with `400` before anything is saved; a session whose stored proxy cannot be built refuses to connect (`status: error`) rather than falling back to the server's own IP.
+
+Rules of thumb from running many accounts: residential or mobile IPs (datacenter ranges are widely flagged), 1–3 accounts per IP, keep an account on the same proxy (IP jumping looks like a hijack), and geo-match the number's country.
+
+#### Test a Proxy
+```http
+POST /proxy/test
+```
+
+**Body:**
+```json
+{ "proxy": "socks5://user:pass@proxy.example.com:1080" }
+```
+or `{ "sessionId": "mysession" }` to test the proxy that session already has.
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Proxy reachable — egress IP 203.0.113.7",
+  "data": {
+    "ok": true,
+    "ip": "203.0.113.7",
+    "latencyMs": 412,
+    "proxy": "socks5://user:***@proxy.example.com:1080"
+  }
+}
+```
+
+`success` is `false` (still HTTP 200) when the proxy does not answer; `data.error` says why. The check fetches `PROXY_CHECK_URL` (default `https://api.ipify.org?format=json`) through the proxy.
 
 #### Add Webhook
 ```http
@@ -715,9 +769,17 @@ POST /chats/profile-picture
 
 ### Bulk Messaging (Background Jobs)
 
-Bulk messaging runs in the background and returns immediately with a job ID. You can track progress using the status endpoint.
+Bulk messaging runs in the background and returns immediately with a job ID. You can track progress using the status endpoint, the `bulk.progress` / `bulk.completed` WebSocket events, or the **Broadcast** panel in the dashboard.
 
-> **⚡ Background Processing**: All bulk endpoints return immediately with a `jobId`. Messages are sent in background to avoid request timeouts. Track progress with the status endpoint.
+> **⚡ Background Processing**: All bulk endpoints return immediately with a `jobId`. Messages are sent one at a time in the background to avoid request timeouts.
+
+How a job behaves:
+
+- Recipients are trimmed and de-duplicated; max 100 per job (`BULK_MAX_RECIPIENTS`).
+- Between messages the sender waits `delayBetweenMessages` plus a random `0..delayJitter` ms — vary the pacing, WhatsApp flags bursts of identical messages.
+- If the session drops mid-job, the job pauses for up to 60s (`BULK_RECONNECT_WAIT_MS`) waiting for it to reconnect, then gives up as `interrupted`.
+- A job can be cancelled; the recipients not yet attempted are recorded as `skipped`.
+- History is kept in `sessions/<sessionId>/bulk-jobs.json` (last 100 jobs per session). After a server restart, jobs that were running are marked `interrupted` — nothing is silently lost, and `retry` picks up the unsent recipients.
 
 #### Send Bulk Text Message
 ```http
@@ -730,7 +792,9 @@ POST /chats/send-bulk
   "sessionId": "mysession",
   "recipients": ["628123456789", "628987654321", "628111222333"],
   "message": "Hello! This is a bulk message.",
-  "delayBetweenMessages": 1000,
+  "name": "September promo",
+  "delayBetweenMessages": 3000,
+  "delayJitter": 2000,
   "typingTime": 0
 }
 ```
@@ -738,9 +802,11 @@ POST /chats/send-bulk
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `sessionId` | string | Required. Session ID |
-| `recipients` | array | Required. Array of phone numbers (max 100) |
+| `recipients` | array | Required. Array of phone numbers or JIDs (max 100) |
 | `message` | string | Required. Text message to send |
-| `delayBetweenMessages` | number | Optional. Delay between messages in ms (default: 1000) |
+| `name` | string | Optional. Label shown in the dashboard |
+| `delayBetweenMessages` | number | Optional. Base delay between messages in ms (default: 1000) |
+| `delayJitter` | number | Optional. Random extra delay of 0..N ms added to each gap (default: 0) |
 | `typingTime` | number | Optional. Typing indicator duration in ms (default: 0) |
 
 **Response:**
@@ -768,7 +834,8 @@ POST /chats/send-bulk-image
   "recipients": ["628123456789", "628987654321"],
   "imageUrl": "https://example.com/image.jpg",
   "caption": "Check out this image!",
-  "delayBetweenMessages": 1000,
+  "delayBetweenMessages": 3000,
+  "delayJitter": 2000,
   "typingTime": 0
 }
 ```
@@ -776,10 +843,12 @@ POST /chats/send-bulk-image
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `sessionId` | string | Required. Session ID |
-| `recipients` | array | Required. Array of phone numbers (max 100) |
+| `recipients` | array | Required. Array of phone numbers or JIDs (max 100) |
 | `imageUrl` | string | Required. Direct URL to image file |
 | `caption` | string | Optional. Image caption |
-| `delayBetweenMessages` | number | Optional. Delay between messages in ms (default: 1000) |
+| `name` | string | Optional. Label shown in the dashboard |
+| `delayBetweenMessages` | number | Optional. Base delay between messages in ms (default: 1000) |
+| `delayJitter` | number | Optional. Random extra delay of 0..N ms (default: 0) |
 | `typingTime` | number | Optional. Typing indicator duration in ms (default: 0) |
 
 #### Send Bulk Document
@@ -795,7 +864,9 @@ POST /chats/send-bulk-document
   "documentUrl": "https://example.com/document.pdf",
   "filename": "document.pdf",
   "mimetype": "application/pdf",
-  "delayBetweenMessages": 1000,
+  "caption": "Here is the brochure",
+  "delayBetweenMessages": 3000,
+  "delayJitter": 2000,
   "typingTime": 0
 }
 ```
@@ -803,11 +874,14 @@ POST /chats/send-bulk-document
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `sessionId` | string | Required. Session ID |
-| `recipients` | array | Required. Array of phone numbers (max 100) |
+| `recipients` | array | Required. Array of phone numbers or JIDs (max 100) |
 | `documentUrl` | string | Required. Direct URL to document |
 | `filename` | string | Required. Filename to display |
 | `mimetype` | string | Optional. MIME type (default: application/pdf) |
-| `delayBetweenMessages` | number | Optional. Delay between messages in ms (default: 1000) |
+| `caption` | string | Optional. Caption under the document |
+| `name` | string | Optional. Label shown in the dashboard |
+| `delayBetweenMessages` | number | Optional. Base delay between messages in ms (default: 1000) |
+| `delayJitter` | number | Optional. Random extra delay of 0..N ms (default: 0) |
 | `typingTime` | number | Optional. Typing indicator duration in ms (default: 0) |
 
 #### Get Bulk Job Status
@@ -820,13 +894,21 @@ GET /chats/bulk-status/:jobId
 {
   "success": true,
   "data": {
+    "jobId": "bulk_1704326400000_abc123def",
     "sessionId": "mysession",
     "type": "text",
+    "name": "September promo",
     "status": "processing",
     "total": 50,
     "sent": 25,
     "failed": 2,
+    "skipped": 0,
     "progress": 54,
+    "cancelRequested": false,
+    "error": null,
+    "payload": { "message": "Hello! This is a bulk message." },
+    "options": { "delayBetweenMessages": 3000, "delayJitter": 2000, "typingTime": 0 },
+    "recipients": ["628123456789", "628987654321", "..."],
     "details": [
       {
         "recipient": "628123456789",
@@ -842,6 +924,7 @@ GET /chats/bulk-status/:jobId
       }
     ],
     "createdAt": "2026-01-04T10:00:00.000Z",
+    "startedAt": "2026-01-04T10:00:00.000Z",
     "completedAt": null
   }
 }
@@ -849,16 +932,41 @@ GET /chats/bulk-status/:jobId
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `status` | string | `processing` or `completed` |
+| `status` | string | `processing`, `completed` (every recipient attempted — check `failed`), `cancelled`, or `interrupted` (session stayed disconnected / server restarted) |
 | `progress` | number | Progress percentage (0-100) |
 | `sent` | number | Successfully sent count |
-| `failed` | number | Failed count |
-| `details` | array | Per-recipient status with timestamps |
+| `failed` | number | Send attempted and rejected |
+| `skipped` | number | Never attempted (job cancelled or interrupted) |
+| `error` | string | Why the job stopped early, when it did |
+| `details` | array | Per-recipient `sent` / `failed` / `skipped` with timestamps |
+
+#### Cancel a Bulk Job
+```http
+POST /chats/bulk-jobs/:jobId/cancel
+```
+
+Stops the job after the message currently in flight. Returns the job summary; `409` if it had already finished.
+
+#### Retry Unsent Recipients
+```http
+POST /chats/bulk-jobs/:jobId/retry
+```
+
+**Body:**
+```json
+{
+  "sessionId": "mysession"
+}
+```
+
+Starts a **new** job with the same content and pacing for every recipient marked `failed` or `skipped` in the source job. Returns the new `jobId` plus `retryOf`; `400` if there is nothing to retry, `409` if the source job is still running.
 
 #### Get All Bulk Jobs
 ```http
 POST /chats/bulk-jobs
 ```
+
+Returns the last 50 jobs for the session, newest first, without the per-recipient `details` / `recipients` arrays. Only requires the session to exist, so history is readable while the phone is offline.
 
 **Body:**
 ```json
@@ -1435,6 +1543,8 @@ socket.emit('unsubscribe', 'mysession');
 | `call` | Incoming call | `{ sessionId, call, timestamp }` |
 | `labels` | Labels updated (business) | `{ sessionId, labels, timestamp }` |
 | `logged.out` | Session logged out | `{ sessionId, message, timestamp }` |
+| `bulk.progress` | A bulk job sent (or failed) one recipient | `{ sessionId, job, last, timestamp }` — `job` is the summary, `last` the recipient just attempted |
+| `bulk.completed` | A bulk job finished (`completed`, `cancelled` or `interrupted`) | `{ sessionId, job, timestamp }` |
 
 ### Example: Listen for Messages
 
@@ -1563,6 +1673,7 @@ All configured webhook endpoints will receive POST requests with this format:
 | `connection.update` | Connection status changed (connected, disconnected) |
 | `message` | New message received |
 | `message.sent` | Message sent confirmation |
+| `bulk.completed` | A bulk messaging job finished (payload: the job summary) |
 
 Set `events: ["all"]` to receive all events, or specify individual events per webhook.
 

@@ -5,6 +5,7 @@ import { type GatewaySession } from "@/lib/gateway-client";
 import { cn } from "@/lib/cn";
 import { useGateway } from "@/store/gateway-store";
 import { Overlays, Toasts, ToolsPanel } from "./Overlays";
+import { BroadcastPanel } from "./Broadcast";
 import Aurora from "./Aurora";
 import {
   IconBell,
@@ -167,6 +168,7 @@ function AccountsRail() {
   const [peek, setPeek] = useState<{
     label: string;
     phone?: string;
+    proxy?: string | null;
     status: string;
     connected: boolean;
     x: number;
@@ -177,6 +179,7 @@ function AccountsRail() {
     setPeek({
       label: a.name || a.sessionId,
       phone: a.phoneNumber,
+      proxy: a.proxy,
       status: a.status,
       connected: a.status === "connected",
       x: r.right,
@@ -256,6 +259,7 @@ function AccountsRail() {
             >
               <div className="truncate text-sm font-semibold text-white">{peek.label}</div>
               <div className="mt-1 truncate text-xs text-cyan-200">{peek.phone ?? "Not linked"}</div>
+              {peek.proxy ? <div className="mt-0.5 truncate font-mono text-[10px] text-indigo-200">via {peek.proxy}</div> : null}
               <div className="mt-2 flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-[0.12em] text-wa">
                 <span
                   className={cn(
@@ -286,17 +290,7 @@ function MainStage() {
   }
   if (nav === "contacts") return <Directory title="Contacts" kind="dm" />;
   if (nav === "groups") return <Directory title="Groups" kind="group" />;
-  if (nav === "broadcast") {
-    return (
-      <div className="glass flex min-w-0 flex-1 items-center justify-center rounded-2xl p-8 text-center">
-        <div>
-          <h2 className="text-lg font-semibold">Broadcast</h2>
-          <p className="mt-2 max-w-sm text-sm text-muted">Send a campaign to many chats at once using saved templates.</p>
-          <OpenBulk />
-        </div>
-      </div>
-    );
-  }
+  if (nav === "broadcast") return <BroadcastPanel />;
   return (
     <div className="flex min-h-0 min-w-0 flex-1 gap-3">
       <div className={cn("h-full w-full max-w-[320px] shrink-0", mobilePane !== "list" && "hidden lg:block")}>
@@ -309,15 +303,6 @@ function MainStage() {
         <ContactPanel />
       </div>
     </div>
-  );
-}
-
-function OpenBulk() {
-  const open = useGateway((s) => s.openOverlay);
-  return (
-    <button className="mt-4 rounded-xl bg-wa px-4 py-2 text-sm font-semibold text-night" onClick={() => open("bulk")}>
-      Open bulk composer
-    </button>
   );
 }
 

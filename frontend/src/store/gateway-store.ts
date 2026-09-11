@@ -2,22 +2,29 @@ import { create } from "zustand";
 import type { Bubble, ChatPreview } from "@/lib/gateway-types";
 import {
   addWebhook as apiAddWebhook,
+  cancelBulkJob,
   connectSession,
   deleteSession as apiDeleteSession,
   getQr,
+  listBulkJobs,
   listChats,
   listMessages,
   listSessions,
   loadWsStats,
   loginDashboard,
   removeWebhook as apiRemoveWebhook,
-  sendBulk,
+  retryBulkJob,
   sendRawApi,
   sendText,
+  startBulkJob,
+  testProxy as apiTestProxy,
+  updateSessionConfig,
+  type BulkJobSummary,
   type GatewayChat,
   type GatewayEvent,
   type GatewayMessage,
   type GatewaySession,
+  type StartBulkInput,
 } from "@/lib/gateway-client";
 
 /** WhatsApp timestamps are seconds; the UI wants a short local clock. */
@@ -71,7 +78,7 @@ function toBubble(m: GatewayMessage): Bubble {
 
 type NavId = "chats" | "contacts" | "groups" | "broadcast" | "tools" | "settings";
 type Filter = "all" | "unread" | "groups";
-type Overlay = null | "qr" | "create-session" | "webhooks" | "bulk" | "templates" | "search";
+type Overlay = null | "qr" | "create-session" | "webhooks" | "proxy" | "bulk" | "templates" | "search";
 
 type State = {
   live: boolean;
@@ -93,7 +100,13 @@ type State = {
   qrSrc: string;
   qrExpiresAt: number | null;
   webhookSessionId: string;
+  /** Session the proxy modal edits. */
+  proxySessionId: string;
   composer: string;
+  /** Session whose campaigns the Broadcast panel shows. */
+  bulkSessionId: string;
+  bulkJobs: BulkJobSummary[];
+  bulkLoading: boolean;
   toasts: Array<{ id: string; type: "success" | "error" | "info"; message: string }>;
   contactTab: "info" | "media" | "files" | "links";
   mobilePane: "list" | "chat" | "profile";
@@ -109,14 +122,23 @@ type State = {
   sendComposer: () => Promise<void>;
   openOverlay: (o: Overlay, extra?: string) => void;
   closeOverlay: () => void;
-  createSession: (id: string, webhook?: string) => Promise<void>;
+  createSession: (id: string, webhook?: string, proxy?: string) => Promise<void>;
+  /** Save (or clear, with null) the proxy a session connects through. Resolves true on success. */
+  setProxy: (sessionId: string, proxy: string | null) => Promise<boolean>;
+  /** Fetch the egress IP through a proxy URL without saving it. */
+  testProxy: (proxy: string) => Promise<{ ok: boolean; message: string; ip?: string; latencyMs?: number }>;
+  refreshSessions: () => Promise<void>;
   reconnect: (id: string) => Promise<void>;
   removeSession: (id: string) => Promise<void>;
   refreshQr: (id: string) => Promise<void>;
   watchQrSession: (id: string) => void;
   addHook: (url: string, events: string[]) => Promise<void>;
   removeHook: (url: string) => Promise<void>;
-  bulkSend: (recipients: string[], message: string) => Promise<void>;
+  setBulkSession: (id: string) => void;
+  loadBulkJobs: () => Promise<void>;
+  startBulk: (input: Omit<StartBulkInput, "sessionId"> & { sessionId?: string }) => Promise<string | null>;
+  cancelBulk: (jobId: string) => Promise<void>;
+  retryBulk: (jobId: string) => Promise<void>;
   applyTemplate: (body: string) => void;
   pushToast: (type: "success" | "error" | "info", message: string) => void;
   dismissToast: (id: string) => void;
@@ -136,6 +158,19 @@ function nid() {
 
 /** Poll interval that watches a pairing session while the QR modal is open. */
 let qrWatchTimer: ReturnType<typeof setInterval> | null = null;
+
+/** Poll interval that refreshes campaign progress while any job is still sending. */
+let bulkWatchTimer: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * Which session a campaign should go out from: the account picked in the rail
+ * if it can send, else the first connected one, else whatever exists.
+ */
+export function pickBulkSession(sessions: GatewaySession[], preferred: string): GatewaySession | undefined {
+  const chosen = sessions.find((s) => s.sessionId === preferred);
+  if (chosen?.status === "connected") return chosen;
+  return sessions.find((s) => s.status === "connected") ?? chosen ?? sessions[0];
+}
 
 export const useGateway = create<State>((set, get) => ({
   live: false,
@@ -157,7 +192,11 @@ export const useGateway = create<State>((set, get) => ({
   qrSrc: "",
   qrExpiresAt: null,
   webhookSessionId: "",
+  proxySessionId: "",
   composer: "",
+  bulkSessionId: "",
+  bulkJobs: [],
+  bulkLoading: false,
   toasts: [],
   contactTab: "info",
   mobilePane: "list",
@@ -248,7 +287,8 @@ export const useGateway = create<State>((set, get) => ({
     // Fire-and-forget: opening a chat must not block on history.
     void get().loadMessages(id);
   },
-  selectAccount: (id) => set({ activeAccountId: id }),
+  // The Broadcast panel follows the account picked in the rail.
+  selectAccount: (id) => set((s) => (s.bulkSessionId === id ? { activeAccountId: id } : { activeAccountId: id, bulkSessionId: id, bulkJobs: [] })),
   setComposer: (composer) => set({ composer }),
   setContactTab: (contactTab) => set({ contactTab }),
   setMobilePane: (mobilePane) => set({ mobilePane }),
@@ -304,6 +344,7 @@ export const useGateway = create<State>((set, get) => ({
       set({ overlay, qrSession: extra ?? "" });
       if (extra) get().watchQrSession(extra);
     } else if (overlay === "webhooks") set({ overlay, webhookSessionId: extra ?? "" });
+    else if (overlay === "proxy") set({ overlay, proxySessionId: extra ?? "" });
     else set({ overlay });
   },
   closeOverlay: () => {
@@ -314,7 +355,7 @@ export const useGateway = create<State>((set, get) => ({
     set({ overlay: null, qrSrc: "", qrExpiresAt: null });
   },
 
-  createSession: async (id, webhook) => {
+  createSession: async (id, webhook, proxy) => {
     if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
       get().pushToast("error", "Invalid session ID");
       return;
@@ -325,7 +366,14 @@ export const useGateway = create<State>((set, get) => ({
     }
     const body: Record<string, unknown> = {};
     if (webhook) body.webhooks = [{ url: webhook }];
-    const result = await connectSession(id, body);
+    if (proxy) body.proxy = proxy;
+    let result: Awaited<ReturnType<typeof connectSession>>;
+    try {
+      result = await connectSession(id, body);
+    } catch {
+      get().pushToast("error", "Gateway unreachable — session not created");
+      return;
+    }
     if (!result.success) {
       get().pushToast("error", result.message || "Failed to create session");
       return;
@@ -333,7 +381,13 @@ export const useGateway = create<State>((set, get) => ({
     set((s) => ({
       sessions: [
         ...s.sessions,
-        { sessionId: id, name: id, status: "qr_ready", webhooks: webhook ? [{ url: webhook }] : [] },
+        {
+          sessionId: id,
+          name: id,
+          status: "qr_ready",
+          webhooks: webhook ? [{ url: webhook }] : [],
+          proxy: proxy ? proxy.replace(/:([^:@/]+)@/, ":***@") : null,
+        },
       ],
       overlay: "qr",
       qrSession: id,
@@ -426,6 +480,58 @@ export const useGateway = create<State>((set, get) => ({
     }, 2000);
   },
 
+  refreshSessions: async () => {
+    if (!get().live) return;
+    try {
+      const result = await listSessions();
+      if (result.success && Array.isArray(result.data)) set({ sessions: result.data });
+    } catch {
+      /* keep what we have */
+    }
+  },
+
+  setProxy: async (sessionId, proxy) => {
+    if (!get().live) {
+      get().pushToast("error", "Not connected to the gateway");
+      return false;
+    }
+    try {
+      const result = await updateSessionConfig(sessionId, { proxy });
+      if (!result.success || !result.data) {
+        get().pushToast("error", result.message || "Could not save proxy");
+        return false;
+      }
+      const saved = result.data.proxy;
+      set((s) => ({
+        sessions: s.sessions.map((sess) => (sess.sessionId === sessionId ? { ...sess, proxy: saved } : sess)),
+      }));
+      get().pushToast(result.data.proxyApplied ? "success" : "info", result.message || "Proxy saved");
+      get().pushEvent("connection", `Session ${sessionId} proxy ${saved ? `set to ${saved}` : "removed"}`);
+      // A live session restarts through the new proxy — pick up its status changes.
+      if (result.data.proxyApplied) setTimeout(() => void get().refreshSessions(), 6000);
+      return true;
+    } catch {
+      get().pushToast("error", "Gateway unreachable — proxy not saved");
+      return false;
+    }
+  },
+
+  testProxy: async (proxy) => {
+    if (!get().live) return { ok: false, message: "Not connected to the gateway" };
+    try {
+      const result = await apiTestProxy({ proxy });
+      const data = result.data;
+      return {
+        ok: Boolean(result.success && data?.ok),
+        message: result.message || (data?.ok ? `Egress IP ${data.ip}` : data?.error || "Proxy check failed"),
+        ip: data?.ip,
+        latencyMs: data?.latencyMs,
+      };
+    } catch {
+      return { ok: false, message: "Gateway unreachable" };
+    }
+  },
+
   addHook: async (url, events) => {
     const sid = get().webhookSessionId;
     try {
@@ -460,18 +566,128 @@ export const useGateway = create<State>((set, get) => ({
     get().pushToast("success", "Webhook removed");
   },
 
-  bulkSend: async (recipients, message) => {
-    const session = get().sessions.find((s) => s.status === "connected") ?? get().sessions[0];
+  setBulkSession: (id) => {
+    if (id === get().bulkSessionId) return;
+    set({ bulkSessionId: id, bulkJobs: [] });
+    void get().loadBulkJobs();
+  },
+
+  /**
+   * Refresh the campaign list for `bulkSessionId` (falling back to the best
+   * available session) and keep polling every 2s while any job is sending.
+   */
+  loadBulkJobs: async () => {
+    const { live, sessions, bulkSessionId, activeAccountId } = get();
+    if (!live) return;
+    const session =
+      sessions.find((s) => s.sessionId === bulkSessionId) ?? pickBulkSession(sessions, activeAccountId);
+    if (!session) {
+      set({ bulkJobs: [], bulkSessionId: "" });
+      return;
+    }
+    if (session.sessionId !== bulkSessionId) set({ bulkSessionId: session.sessionId });
+    set({ bulkLoading: true });
     try {
-      if (get().live && session) {
-        await sendBulk({ sessionId: session.sessionId, recipients, message, delay: 1000 });
+      const result = await listBulkJobs(session.sessionId);
+      if (result.success && Array.isArray(result.data)) {
+        const previous = get().bulkJobs;
+        set({ bulkJobs: result.data });
+        // Announce jobs that finished since the last poll.
+        for (const job of result.data) {
+          const before = previous.find((j) => j.jobId === job.jobId);
+          if (before && before.status === "processing" && job.status !== "processing") {
+            const label = job.name || `${job.type} campaign`;
+            if (job.status === "completed") {
+              get().pushToast(job.failed ? "info" : "success", `${label}: ${job.sent} sent, ${job.failed} failed`);
+            } else {
+              get().pushToast("error", `${label} ${job.status} — ${job.sent}/${job.total} sent`);
+            }
+            get().pushEvent("message", `Campaign ${job.jobId} ${job.status}: ${job.sent} sent, ${job.failed} failed`);
+          }
+        }
+      } else if (!result.success) {
+        get().pushEvent("error", result.message ?? "Could not load campaigns");
       }
     } catch {
-      /* already reported to the user via a toast */
+      get().pushEvent("error", "Could not load campaigns");
+    } finally {
+      set({ bulkLoading: false });
     }
-    get().pushEvent("message", `Bulk to ${recipients.length} chats: ${message.slice(0, 40)}`);
-    get().pushToast("success", `Queued for ${recipients.length} chats`);
-    set({ overlay: null });
+
+    const running = get().bulkJobs.some((j) => j.status === "processing");
+    if (running && !bulkWatchTimer) {
+      bulkWatchTimer = setInterval(() => void get().loadBulkJobs(), 2000);
+    } else if (!running && bulkWatchTimer) {
+      clearInterval(bulkWatchTimer);
+      bulkWatchTimer = null;
+    }
+  },
+
+  /** Start a campaign. Resolves with the jobId, or null when nothing was queued. */
+  startBulk: async (input) => {
+    const { live, sessions, activeAccountId, pushToast, pushEvent } = get();
+    if (!live) {
+      pushToast("error", "Not connected to the gateway");
+      return null;
+    }
+    const session = input.sessionId
+      ? sessions.find((s) => s.sessionId === input.sessionId)
+      : pickBulkSession(sessions, activeAccountId);
+    if (!session || session.status !== "connected") {
+      pushToast("error", "Pick a connected session to send from");
+      return null;
+    }
+    try {
+      const result = await startBulkJob({ ...input, sessionId: session.sessionId });
+      if (!result.success || !result.data) {
+        pushToast("error", result.message || "Could not start campaign");
+        return null;
+      }
+      pushEvent("message", `Campaign ${result.data.jobId} started: ${result.data.total} recipients`);
+      pushToast("success", `Sending to ${result.data.total} recipients`);
+      set({ overlay: null, nav: "broadcast", bulkSessionId: session.sessionId });
+      await get().loadBulkJobs();
+      return result.data.jobId;
+    } catch {
+      pushToast("error", "Gateway unreachable — campaign not started");
+      return null;
+    }
+  },
+
+  cancelBulk: async (jobId) => {
+    try {
+      const result = await cancelBulkJob(jobId);
+      if (!result.success) {
+        get().pushToast("error", result.message || "Could not cancel");
+      } else {
+        get().pushToast("info", "Stopping after the current message…");
+        get().pushEvent("message", `Campaign ${jobId} cancel requested`);
+      }
+    } catch {
+      get().pushToast("error", "Gateway unreachable — could not cancel");
+    }
+    await get().loadBulkJobs();
+  },
+
+  retryBulk: async (jobId) => {
+    const sid = get().bulkSessionId;
+    const session = get().sessions.find((s) => s.sessionId === sid);
+    if (!session || session.status !== "connected") {
+      get().pushToast("error", "Session must be connected to retry");
+      return;
+    }
+    try {
+      const result = await retryBulkJob(sid, jobId);
+      if (!result.success || !result.data) {
+        get().pushToast("error", result.message || "Could not retry");
+        return;
+      }
+      get().pushToast("success", `Retrying ${result.data.total} recipient(s)`);
+      get().pushEvent("message", `Campaign ${result.data.jobId} retries ${jobId}`);
+    } catch {
+      get().pushToast("error", "Gateway unreachable — could not retry");
+    }
+    await get().loadBulkJobs();
   },
 
   applyTemplate: (body) => set({ composer: body, overlay: null }),

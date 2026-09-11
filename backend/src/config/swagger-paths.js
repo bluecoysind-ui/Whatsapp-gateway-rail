@@ -134,11 +134,20 @@
  *                 type: array
  *                 items:
  *                   $ref: '#/components/schemas/Webhook'
+ *               proxy:
+ *                 type: string
+ *                 nullable: true
+ *                 example: socks5://user:pass@proxy.example.com:1080
+ *                 description: |
+ *                   Proxy this session connects through — the WhatsApp WebSocket and media
+ *                   uploads/downloads both use it. `socks5://`, `socks4://` or `http(s)://`,
+ *                   with optional `user:pass@`. Stored per session; the password is masked
+ *                   in every response.
  *     responses:
  *       200:
  *         description: Session created/connected
  *       400:
- *         description: Session already exists
+ *         description: Session already exists, or invalid proxy URL
  */
 
 /**
@@ -221,7 +230,12 @@
  *   patch:
  *     tags: [Sessions]
  *     summary: Update session config
- *     description: Update metadata and webhooks for a session
+ *     description: |
+ *       Update metadata, webhooks and/or the proxy for a session.
+ *
+ *       Changing `proxy` on a live session (connecting / qr_ready / connected) restarts its
+ *       socket through the new proxy right away — a few seconds offline, no new QR for a
+ *       paired session. Pass `reconnect: false` to only save it for the next connect.
  *     parameters:
  *       - in: path
  *         name: sessionId
@@ -240,9 +254,103 @@
  *                 type: array
  *                 items:
  *                   $ref: '#/components/schemas/Webhook'
+ *               proxy:
+ *                 type: string
+ *                 nullable: true
+ *                 example: socks5://user:pass@proxy.example.com:1080
+ *                 description: Proxy URL, or null / empty string to remove the proxy
+ *               reconnect:
+ *                 type: boolean
+ *                 default: true
+ *                 description: Restart a live session so a changed proxy applies now
  *     responses:
  *       200:
  *         description: Config updated
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 message:
+ *                   type: string
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     sessionId:
+ *                       type: string
+ *                     metadata:
+ *                       type: object
+ *                     webhooks:
+ *                       type: array
+ *                       items:
+ *                         $ref: '#/components/schemas/Webhook'
+ *                     proxy:
+ *                       type: string
+ *                       nullable: true
+ *                       description: Saved proxy with the password masked
+ *                     proxyApplied:
+ *                       type: boolean
+ *                       description: false when the proxy was saved but will only be used on the next connect
+ *       400:
+ *         description: Invalid proxy URL
+ */
+
+/**
+ * @swagger
+ * /api/whatsapp/proxy/test:
+ *   post:
+ *     tags: [Sessions]
+ *     summary: Test a proxy
+ *     description: |
+ *       Fetches the egress IP through the proxy (from `PROXY_CHECK_URL`, default api.ipify.org)
+ *       and reports it with the round-trip time. Pass `proxy` to test any URL, or `sessionId`
+ *       to test the proxy that session has configured.
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               proxy:
+ *                 type: string
+ *                 example: socks5://user:pass@proxy.example.com:1080
+ *               sessionId:
+ *                 type: string
+ *                 example: mysession
+ *     responses:
+ *       200:
+ *         description: Check result (`success` is false when the proxy did not answer)
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 message:
+ *                   type: string
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     ok:
+ *                       type: boolean
+ *                     ip:
+ *                       type: string
+ *                       description: Public IP the proxy exits from
+ *                     latencyMs:
+ *                       type: integer
+ *                     error:
+ *                       type: string
+ *                     proxy:
+ *                       type: string
+ *                       description: The tested URL with the password masked
+ *       400:
+ *         description: No proxy given, session has none, or invalid URL
+ *       404:
+ *         description: Session not found
  */
 
 /**
@@ -679,18 +787,48 @@
  *                     type:
  *                       type: string
  *                       enum: [text, image, document]
+ *                     jobId:
+ *                       type: string
+ *                     name:
+ *                       type: string
+ *                       nullable: true
+ *                       description: Optional label given when the job was created
  *                     status:
  *                       type: string
- *                       enum: [processing, completed]
+ *                       enum: [processing, completed, cancelled, interrupted]
+ *                       description: |
+ *                         `completed` = every recipient attempted (check `failed`),
+ *                         `cancelled` = stopped by /bulk-jobs/{jobId}/cancel,
+ *                         `interrupted` = session stayed disconnected or the server restarted.
+ *                         Recipients not attempted are recorded as `skipped`.
  *                     total:
  *                       type: integer
  *                     sent:
  *                       type: integer
  *                     failed:
  *                       type: integer
+ *                     skipped:
+ *                       type: integer
  *                     progress:
  *                       type: integer
  *                       description: Progress percentage (0-100)
+ *                     cancelRequested:
+ *                       type: boolean
+ *                     error:
+ *                       type: string
+ *                       nullable: true
+ *                     payload:
+ *                       type: object
+ *                       description: The content being sent (message / imageUrl+caption / documentUrl+filename+mimetype+caption)
+ *                     options:
+ *                       type: object
+ *                       properties:
+ *                         delayBetweenMessages:
+ *                           type: integer
+ *                         delayJitter:
+ *                           type: integer
+ *                         typingTime:
+ *                           type: integer
  *                     details:
  *                       type: array
  *                       items:
@@ -700,6 +838,7 @@
  *                             type: string
  *                           status:
  *                             type: string
+ *                             enum: [sent, failed, skipped]
  *                           messageId:
  *                             type: string
  *                           error:
@@ -707,6 +846,8 @@
  *                           timestamp:
  *                             type: string
  *                     createdAt:
+ *                       type: string
+ *                     startedAt:
  *                       type: string
  *                     completedAt:
  *                       type: string
@@ -716,11 +857,84 @@
 
 /**
  * @swagger
+ * /api/whatsapp/chats/bulk-jobs/{jobId}/cancel:
+ *   post:
+ *     tags: [Bulk Messaging]
+ *     summary: Cancel a running bulk job
+ *     description: Stops the job after the message currently in flight. Remaining recipients are recorded as `skipped`.
+ *     parameters:
+ *       - in: path
+ *         name: jobId
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Cancellation requested
+ *       404:
+ *         description: Job not found
+ *       409:
+ *         description: Job already finished
+ */
+
+/**
+ * @swagger
+ * /api/whatsapp/chats/bulk-jobs/{jobId}/retry:
+ *   post:
+ *     tags: [Bulk Messaging]
+ *     summary: Retry the recipients a finished job did not reach
+ *     description: Starts a new job with the same content and pacing for every recipient marked `failed` or `skipped` in the source job.
+ *     parameters:
+ *       - in: path
+ *         name: jobId
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [sessionId]
+ *             properties:
+ *               sessionId:
+ *                 type: string
+ *                 example: mysession
+ *     responses:
+ *       200:
+ *         description: Retry job started
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     jobId:
+ *                       type: string
+ *                     total:
+ *                       type: integer
+ *                     retryOf:
+ *                       type: string
+ *                     statusUrl:
+ *                       type: string
+ *       400:
+ *         description: Nothing to retry
+ *       409:
+ *         description: Source job still running
+ */
+
+/**
+ * @swagger
  * /api/whatsapp/chats/bulk-jobs:
  *   post:
  *     tags: [Bulk Messaging]
  *     summary: Get all bulk jobs for a session
- *     description: Retrieve list of all bulk messaging jobs for a specific session (last 50)
+ *     description: Retrieve list of all bulk messaging jobs for a specific session (last 50, newest first, without per-recipient details). Works while the session is disconnected.
  *     requestBody:
  *       required: true
  *       content:
@@ -749,15 +963,21 @@
  *                     properties:
  *                       jobId:
  *                         type: string
+ *                       name:
+ *                         type: string
+ *                         nullable: true
  *                       type:
  *                         type: string
  *                       status:
  *                         type: string
+ *                         enum: [processing, completed, cancelled, interrupted]
  *                       total:
  *                         type: integer
  *                       sent:
  *                         type: integer
  *                       failed:
+ *                         type: integer
+ *                       skipped:
  *                         type: integer
  *                       progress:
  *                         type: integer
@@ -777,10 +997,13 @@
  *       Send the same text message to multiple recipients. **Runs in background** - returns immediately with a jobId to track progress.
  *       
  *       **Features:**
- *       - Maximum 100 recipients per request
+ *       - Maximum 100 recipients per request (duplicates are removed)
  *       - Runs in background, returns immediately
- *       - Track progress using GET /chats/bulk-status/{jobId}
- *       - Automatic delay between messages to avoid rate limiting
+ *       - Track progress using GET /chats/bulk-status/{jobId}, or listen for the
+ *         `bulk.progress` / `bulk.completed` WebSocket events (`bulk.completed` is also sent to webhooks)
+ *       - Delay + random jitter between messages to keep the pacing human-like
+ *       - If the session drops mid-job, the job waits up to 60s for it to reconnect
+ *       - Cancel with POST /chats/bulk-jobs/{jobId}/cancel
  *     requestBody:
  *       required: true
  *       content:
@@ -801,10 +1024,18 @@
  *               message:
  *                 type: string
  *                 example: Hello! This is a bulk message.
+ *               name:
+ *                 type: string
+ *                 example: September promo
+ *                 description: Optional label shown in the dashboard
  *               delayBetweenMessages:
  *                 type: integer
- *                 example: 1000
- *                 description: Delay between messages in milliseconds (default 1000ms)
+ *                 example: 3000
+ *                 description: Base delay between messages in milliseconds (default 1000ms)
+ *               delayJitter:
+ *                 type: integer
+ *                 example: 2000
+ *                 description: Random extra delay of 0..delayJitter ms added to each gap (default 0)
  *               typingTime:
  *                 type: integer
  *                 example: 0
@@ -870,9 +1101,15 @@
  *               caption:
  *                 type: string
  *                 example: Check out this image!
+ *               name:
+ *                 type: string
+ *                 description: Optional label shown in the dashboard
  *               delayBetweenMessages:
  *                 type: integer
- *                 example: 1000
+ *                 example: 3000
+ *               delayJitter:
+ *                 type: integer
+ *                 example: 2000
  *               typingTime:
  *                 type: integer
  *                 example: 0
@@ -934,9 +1171,18 @@
  *               mimetype:
  *                 type: string
  *                 example: application/pdf
+ *               caption:
+ *                 type: string
+ *                 example: Here is the brochure
+ *               name:
+ *                 type: string
+ *                 description: Optional label shown in the dashboard
  *               delayBetweenMessages:
  *                 type: integer
- *                 example: 1000
+ *                 example: 3000
+ *               delayJitter:
+ *                 type: integer
+ *                 example: 2000
  *               typingTime:
  *                 type: integer
  *                 example: 0

@@ -3,6 +3,7 @@ import { API_ENDPOINTS, sampleBodyFor } from "@/lib/gateway-client";
 import { TEMPLATES } from "@/lib/templates";
 import { useGateway } from "@/store/gateway-store";
 import { cn } from "@/lib/cn";
+import { BulkComposer } from "./Broadcast";
 
 export function Overlays() {
   const overlay = useGateway((s) => s.overlay);
@@ -25,6 +26,7 @@ export function Overlays() {
       {overlay === "qr" && <QrModal />}
       {overlay === "create-session" && <CreateSessionModal />}
       {overlay === "webhooks" && <WebhooksModal />}
+      {overlay === "proxy" && <ProxyModal />}
       {overlay === "bulk" && <BulkModal />}
       {overlay === "templates" && <TemplatesModal />}
       {overlay === "search" && <SearchModal />}
@@ -32,9 +34,26 @@ export function Overlays() {
   );
 }
 
-function Card({ title, sub, children, wide }: { title: string; sub?: string; children: React.ReactNode; wide?: boolean }) {
+function Card({
+  title,
+  sub,
+  children,
+  wide,
+  size,
+}: {
+  title: string;
+  sub?: string;
+  children: React.ReactNode;
+  wide?: boolean;
+  size?: "xl";
+}) {
   return (
-    <div className={cn("glass max-h-[90vh] overflow-y-auto rounded-3xl p-7 text-center", wide ? "w-full max-w-xl" : "w-full max-w-md")}>
+    <div
+      className={cn(
+        "glass max-h-[90vh] overflow-y-auto rounded-3xl p-7 text-center",
+        size === "xl" ? "w-full max-w-4xl" : wide ? "w-full max-w-xl" : "w-full max-w-md",
+      )}
+    >
       <h2 className="text-lg font-semibold">{title}</h2>
       {sub ? <p className="mt-1 text-sm text-muted">{sub}</p> : null}
       <div className="mt-5">{children}</div>
@@ -89,6 +108,7 @@ function CreateSessionModal() {
   const { createSession, closeOverlay } = useGateway();
   const [id, setId] = useState("");
   const [hook, setHook] = useState("");
+  const [proxy, setProxy] = useState("");
   return (
     <Card title="Create New Session" sub="Connect another WhatsApp number">
       <label className="mb-3 block text-left text-xs text-muted">
@@ -100,7 +120,7 @@ function CreateSessionModal() {
           className="mt-1 w-full rounded-xl border border-line bg-night/40 px-3 py-2.5 text-sm text-ink outline-none"
         />
       </label>
-      <label className="mb-4 block text-left text-xs text-muted">
+      <label className="mb-3 block text-left text-xs text-muted">
         Webhook URL (optional)
         <input
           value={hook}
@@ -109,15 +129,115 @@ function CreateSessionModal() {
           className="mt-1 w-full rounded-xl border border-line bg-night/40 px-3 py-2.5 text-sm text-ink outline-none"
         />
       </label>
+      <div className="mb-4">
+        <ProxyField value={proxy} onChange={setProxy} />
+      </div>
       <div className="flex justify-center gap-3">
         <button className="rounded-xl border border-line px-4 py-2 text-sm" onClick={closeOverlay}>
           Cancel
         </button>
         <button
           className="rounded-xl bg-wa px-4 py-2 text-sm font-semibold text-night"
-          onClick={() => void createSession(id.trim(), hook.trim() || undefined)}
+          onClick={() => void createSession(id.trim(), hook.trim() || undefined, proxy.trim() || undefined)}
         >
           Create & Connect
+        </button>
+      </div>
+    </Card>
+  );
+}
+
+/**
+ * Proxy URL input with a "Test" button that fetches the egress IP through it.
+ * Shared by the create-session and proxy modals.
+ */
+function ProxyField({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const testProxy = useGateway((s) => s.testProxy);
+  const [checking, setChecking] = useState(false);
+  const [result, setResult] = useState<{ ok: boolean; message: string; latencyMs?: number } | null>(null);
+  const run = async () => {
+    if (!value.trim()) return;
+    setChecking(true);
+    setResult(await testProxy(value.trim()));
+    setChecking(false);
+  };
+  return (
+    <label className="block text-left text-xs text-muted">
+      Proxy (optional)
+      <span className="mt-1 flex gap-2">
+        <input
+          value={value}
+          onChange={(e) => {
+            onChange(e.target.value);
+            setResult(null);
+          }}
+          placeholder="socks5://user:pass@host:1080"
+          spellCheck={false}
+          className="min-w-0 flex-1 rounded-xl border border-line bg-night/40 px-3 py-2.5 font-mono text-[12px] text-ink outline-none"
+        />
+        <button
+          type="button"
+          disabled={!value.trim() || checking}
+          onClick={() => void run()}
+          className="shrink-0 rounded-xl border border-line px-3 py-2 text-xs disabled:opacity-50"
+        >
+          {checking ? "Testing…" : "Test"}
+        </button>
+      </span>
+      <span className="mt-1 block text-[11px]">
+        {result ? (
+          <span className={result.ok ? "text-wa" : "text-danger"}>
+            {result.message}
+            {result.ok && result.latencyMs ? ` · ${result.latencyMs} ms` : ""}
+          </span>
+        ) : (
+          <span className="text-dim">socks5:// or http(s)://. Every connection of this session — socket and media — goes through it.</span>
+        )}
+      </span>
+    </label>
+  );
+}
+
+function ProxyModal() {
+  const { proxySessionId, sessions, setProxy, closeOverlay } = useGateway();
+  const session = sessions.find((s) => s.sessionId === proxySessionId);
+  const current = session?.proxy ?? null;
+  const [value, setValue] = useState("");
+  const [saving, setSaving] = useState(false);
+  const live = session ? ["connecting", "qr_ready", "connected"].includes(session.status) : false;
+  const save = async (proxy: string | null) => {
+    setSaving(true);
+    const ok = await setProxy(proxySessionId, proxy);
+    setSaving(false);
+    if (ok) closeOverlay();
+  };
+  return (
+    <Card title="Session Proxy" sub={`Session: ${proxySessionId}`}>
+      <div className="mb-3 rounded-xl border border-line bg-night/30 px-3 py-2 text-left text-xs">
+        <div className="text-[10px] uppercase tracking-wide text-muted">Current</div>
+        <div className={cn("mt-0.5 font-mono text-[12px] break-all", current ? "text-ink" : "text-dim")}>{current ?? "Direct connection (no proxy)"}</div>
+      </div>
+      <ProxyField value={value} onChange={setValue} />
+      <p className="mt-2 text-left text-[11px] text-muted">
+        {live
+          ? "Saving restarts the session through the new proxy (a few seconds offline; no new QR needed once paired)."
+          : "The proxy is used the next time this session connects."}
+      </p>
+      <div className="mt-4 flex flex-wrap justify-center gap-2">
+        <button className="rounded-xl border border-line px-4 py-2 text-sm" onClick={closeOverlay}>
+          Cancel
+        </button>
+        {current ? (
+          <button className="rounded-xl border border-danger/30 px-4 py-2 text-sm text-danger disabled:opacity-50" disabled={saving} onClick={() => void save(null)}>
+            Remove proxy
+          </button>
+        ) : null}
+        <button
+          className="rounded-xl bg-wa px-4 py-2 text-sm font-semibold text-night disabled:opacity-50"
+          disabled={saving || !value.trim()}
+          onClick={() => void save(value.trim())}
+        >
+          {saving ? "Saving…" : live ? "Save & reconnect" : "Save"}
         </button>
       </div>
     </Card>
@@ -170,42 +290,9 @@ function WebhooksModal() {
 }
 
 function BulkModal() {
-  const { chats, bulkSend, closeOverlay } = useGateway();
-  const [msg, setMsg] = useState("Hello from WA Gateway!");
-  const [selected, setSelected] = useState<string[]>(chats.map((c) => c.id));
   return (
-    <Card title="Bulk Message" sub="Send to multiple chats" wide>
-      <div className="mb-3 max-h-40 space-y-1 overflow-auto text-left">
-        {chats.map((c) => (
-          <label key={c.id} className="flex items-center gap-2 rounded-lg px-2 py-1 text-sm">
-            <input
-              type="checkbox"
-              checked={selected.includes(c.id)}
-              onChange={() =>
-                setSelected((s) => (s.includes(c.id) ? s.filter((x) => x !== c.id) : [...s, c.id]))
-              }
-            />
-            {c.name}
-          </label>
-        ))}
-      </div>
-      <textarea
-        value={msg}
-        onChange={(e) => setMsg(e.target.value)}
-        rows={3}
-        className="mb-4 w-full rounded-xl border border-line bg-night/40 px-3 py-2 text-left text-sm text-ink outline-none"
-      />
-      <div className="flex justify-center gap-3">
-        <button className="rounded-xl border border-line px-4 py-2 text-sm" onClick={closeOverlay}>
-          Cancel
-        </button>
-        <button
-          className="rounded-xl bg-wa px-4 py-2 text-sm font-semibold text-night"
-          onClick={() => void bulkSend(selected, msg)}
-        >
-          Send to {selected.length} chats
-        </button>
-      </div>
+    <Card title="New campaign" sub="Send one message to many chats — runs in the background with progress tracking" size="xl">
+      <BulkComposer />
     </Card>
   );
 }
@@ -348,7 +435,10 @@ export function ToolsPanel() {
                 </div>
                 <div className="min-w-0 flex-1">
                   <div className="truncate text-sm font-medium">{s.name || s.sessionId}</div>
-                  <div className="text-xs text-muted">{s.phoneNumber || s.sessionId}</div>
+                  <div className="truncate text-xs text-muted">
+                    {s.phoneNumber || s.sessionId}
+                    {s.proxy ? <span className="ml-2 rounded-full border border-indigo/40 px-1.5 py-px text-[10px] text-indigo" title={s.proxy}>proxy</span> : null}
+                  </div>
                 </div>
                 <span className={cn("rounded-full px-2 py-0.5 text-[11px]", s.status === "connected" ? "bg-wa/15 text-wa" : "bg-danger/15 text-danger")}>
                   {s.status}
@@ -361,6 +451,9 @@ export function ToolsPanel() {
                 </button>
                 <button className="text-xs text-muted" onClick={() => openOverlay("webhooks", s.sessionId)}>
                   Hooks
+                </button>
+                <button className={cn("text-xs", s.proxy ? "text-indigo" : "text-muted")} onClick={() => openOverlay("proxy", s.sessionId)}>
+                  Proxy
                 </button>
                 <button className="text-xs text-danger" onClick={() => void removeSession(s.sessionId)}>
                   Delete

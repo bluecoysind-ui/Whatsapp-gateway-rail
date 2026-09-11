@@ -7,6 +7,7 @@ const qrcode = require('qrcode');
 const BaileysStore = require('./BaileysStore');
 const MessageFormatter = require('./MessageFormatter');
 const wsManager = require('../websocket/WebSocketManager');
+const { buildProxyAgents, redactProxyUrl } = require('./proxy');
 
 /** How long a QR pairing window stays open before the session is revoked (ms). */
 const QR_EXPIRY_MS = Number(process.env.QR_EXPIRY_MS) || 120_000;
@@ -36,6 +37,8 @@ class WhatsAppSession {
         // Custom metadata and webhook
         this.metadata = options.metadata || {};
         this.webhooks = options.webhooks || []; // Array of { url, events? }
+        // Proxy URL (socks5:// or http://) every connection of this session goes through
+        this.proxy = options.proxy || null;
         
         // Load config if exists
         this._loadConfig();
@@ -50,6 +53,7 @@ class WhatsAppSession {
                 const config = JSON.parse(fs.readFileSync(this.configFile, 'utf8'));
                 this.metadata = config.metadata || this.metadata;
                 this.webhooks = config.webhooks || this.webhooks;
+                if (config.proxy !== undefined) this.proxy = config.proxy || null;
             }
         } catch (e) {
             console.log(`⚠️ [${this.sessionId}] Could not load config:`, e.message);
@@ -66,7 +70,8 @@ class WhatsAppSession {
             }
             fs.writeFileSync(this.configFile, JSON.stringify({
                 metadata: this.metadata,
-                webhooks: this.webhooks
+                webhooks: this.webhooks,
+                proxy: this.proxy
             }, null, 2));
         } catch (e) {
             console.log(`⚠️ [${this.sessionId}] Could not save config:`, e.message);
@@ -82,6 +87,9 @@ class WhatsAppSession {
         }
         if (options.webhooks !== undefined) {
             this.webhooks = options.webhooks;
+        }
+        if (options.proxy !== undefined) {
+            this.proxy = options.proxy || null;
         }
         this._saveConfig();
         return this.getInfo();
@@ -183,7 +191,9 @@ class WhatsAppSession {
                 }
             }
 
-            // Save store periodically (every 30 seconds) and cleanup old media
+            // Save store periodically (every 30 seconds) and cleanup old media.
+            // Reconnects re-enter here, so drop the previous timer first.
+            if (this.storeInterval) clearInterval(this.storeInterval);
             this.storeInterval = setInterval(() => {
                 try {
                     // Cleanup old media files before saving (keep only last 100 per chat)
@@ -194,6 +204,19 @@ class WhatsAppSession {
                 }
             }, 30_000);
 
+            // Socket + media traffic both go through the session's proxy, if set.
+            let proxyAgents = null;
+            if (this.proxy) {
+                try {
+                    proxyAgents = buildProxyAgents(this.proxy);
+                    console.log(`🛡️ [${this.sessionId}] Connecting through proxy ${redactProxyUrl(this.proxy)}`);
+                } catch (error) {
+                    this.connectionStatus = 'error';
+                    console.error(`[${this.sessionId}] Invalid proxy, not connecting:`, error.message);
+                    return { success: false, message: `Invalid proxy: ${error.message}` };
+                }
+            }
+
             const { state, saveCreds } = await useMultiFileAuthState(this.authFolder);
             const { version } = await fetchLatestBaileysVersion();
 
@@ -202,7 +225,8 @@ class WhatsAppSession {
                 auth: state,
                 logger: pino({ level: 'silent' }),
                 browser: ['Chatery API', 'Chrome', '1.0.0'],
-                syncFullHistory: true
+                syncFullHistory: true,
+                ...(proxyAgents ? { agent: proxyAgents.agent, fetchAgent: proxyAgents.fetchAgent } : {})
             });
 
             // Bind store to socket events
@@ -215,6 +239,25 @@ class WhatsAppSession {
         } catch (error) {
             console.error(`[${this.sessionId}] Error connecting:`, error);
             this.connectionStatus = 'error';
+            return { success: false, message: error.message };
+        }
+    }
+
+    /**
+     * Drop the live socket and let the close handler reconnect with the
+     * current config (e.g. a new proxy). Credentials are kept — no new QR is
+     * needed for a paired session.
+     */
+    async restart(reason = 'Restart requested') {
+        if (!this.socket) {
+            return this.connect();
+        }
+        try {
+            console.log(`🔁 [${this.sessionId}] Restarting connection: ${reason}`);
+            // No loggedOut status code on this error -> handler schedules connect() in 5s.
+            this.socket.end(new Error(reason));
+            return { success: true, message: 'Reconnecting with the current configuration' };
+        } catch (error) {
             return { success: false, message: error.message };
         }
     }
@@ -556,7 +599,8 @@ class WhatsAppSession {
             qrExpiresAt: this.qrExpiresAt,
             storeStats: this.store ? this.store.getStats() : null,
             metadata: this.metadata,
-            webhooks: this.webhooks
+            webhooks: this.webhooks,
+            proxy: redactProxyUrl(this.proxy)
         };
     }
 

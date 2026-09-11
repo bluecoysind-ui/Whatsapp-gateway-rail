@@ -1,6 +1,23 @@
 const express = require('express');
 const router = express.Router();
 const whatsappManager = require('../services/whatsapp');
+const bulkJobManager = require('../services/whatsapp/BulkJobManager');
+const { parseProxyUrl, checkProxy } = require('../services/whatsapp/proxy');
+
+/**
+ * Normalise a `proxy` field from a request body: undefined = untouched,
+ * null/"" = clear, otherwise a validated URL. Throws with a user-facing
+ * message on a bad URL.
+ */
+const normaliseProxyInput = (value) => {
+    if (value === undefined) return undefined;
+    if (value === null || (typeof value === 'string' && value.trim() === '')) return null;
+    if (typeof value !== 'string') throw new Error('proxy must be a URL string or null');
+    return parseProxyUrl(value).url;
+};
+
+/** Connection states in which a proxy change needs a socket restart to take effect. */
+const LIVE_STATES = new Set(['connecting', 'qr_ready', 'connected']);
 
 // Get all sessions
 router.get('/sessions', (req, res) => {
@@ -16,7 +33,8 @@ router.get('/sessions', (req, res) => {
                 phoneNumber: s.phoneNumber,
                 name: s.name,
                 webhooks: s.webhooks || [],
-                metadata: s.metadata || {}
+                metadata: s.metadata || {},
+                proxy: s.proxy || null
             }))
         });
     } catch (error) {
@@ -31,12 +49,18 @@ router.get('/sessions', (req, res) => {
 router.post('/sessions/:sessionId/connect', async (req, res) => {
     try {
         const { sessionId } = req.params;
-        const { metadata, webhooks } = req.body || {};
-        
+        const { metadata, webhooks, proxy } = req.body || {};
+
         const options = {};
         if (metadata) options.metadata = metadata;
         if (webhooks) options.webhooks = webhooks;
-        
+        try {
+            const proxyUrl = normaliseProxyInput(proxy);
+            if (proxyUrl !== undefined) options.proxy = proxyUrl;
+        } catch (error) {
+            return res.status(400).json({ success: false, message: error.message });
+        }
+
         const result = await whatsappManager.createSession(sessionId, options);
         
         res.json({
@@ -76,7 +100,8 @@ router.get('/sessions/:sessionId/status', (req, res) => {
                 phoneNumber: info.phoneNumber,
                 name: info.name,
                 metadata: info.metadata,
-                webhooks: info.webhooks
+                webhooks: info.webhooks,
+                proxy: info.proxy
             }
         });
     } catch (error) {
@@ -87,35 +112,111 @@ router.get('/sessions/:sessionId/status', (req, res) => {
     }
 });
 
-// Update session config (metadata, webhooks)
-router.patch('/sessions/:sessionId/config', (req, res) => {
+// Update session config (metadata, webhooks, proxy)
+router.patch('/sessions/:sessionId/config', async (req, res) => {
     try {
         const { sessionId } = req.params;
-        const { metadata, webhooks } = req.body || {};
-        
+        const { metadata, webhooks, proxy, reconnect = true } = req.body || {};
+
         const session = whatsappManager.getSession(sessionId);
-        
+
         if (!session) {
             return res.status(404).json({
                 success: false,
                 message: 'Session not found'
             });
         }
-        
+
         const options = {};
         if (metadata !== undefined) options.metadata = metadata;
         if (webhooks !== undefined) options.webhooks = webhooks;
-        
+        let proxyUrl;
+        try {
+            proxyUrl = normaliseProxyInput(proxy);
+        } catch (error) {
+            return res.status(400).json({ success: false, message: error.message });
+        }
+        const proxyChanged = proxyUrl !== undefined && proxyUrl !== (session.proxy || null);
+        if (proxyUrl !== undefined) options.proxy = proxyUrl;
+
         const updatedInfo = session.updateConfig(options);
-        
+
+        // A proxy only takes effect on the next socket; restart a live one now
+        // unless the caller asked to defer.
+        let message = 'Session config updated';
+        let proxyApplied = !proxyChanged;
+        if (proxyChanged) {
+            if (LIVE_STATES.has(session.connectionStatus) && reconnect !== false) {
+                const restart = await session.restart('Proxy changed');
+                proxyApplied = restart.success;
+                message = restart.success
+                    ? 'Proxy saved — reconnecting the session through it'
+                    : `Proxy saved, but restart failed: ${restart.message}`;
+            } else {
+                message = 'Proxy saved — it applies when the session next connects';
+            }
+        }
+
         res.json({
             success: true,
-            message: 'Session config updated',
+            message,
             data: {
                 sessionId: updatedInfo.sessionId,
                 metadata: updatedInfo.metadata,
-                webhooks: updatedInfo.webhooks
+                webhooks: updatedInfo.webhooks,
+                proxy: updatedInfo.proxy,
+                proxyApplied
             }
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
+});
+
+// Test a proxy: fetch the egress IP through it. Pass `proxy` directly, or
+// `sessionId` to test the proxy that session has configured.
+router.post('/proxy/test', async (req, res) => {
+    try {
+        const { proxy, sessionId } = req.body || {};
+        let target = proxy;
+
+        if (target === undefined || target === null || target === '') {
+            if (!sessionId) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Provide proxy (URL) or sessionId'
+                });
+            }
+            const session = whatsappManager.getSession(sessionId);
+            if (!session) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'Session not found'
+                });
+            }
+            if (!session.proxy) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Session has no proxy configured'
+                });
+            }
+            target = session.proxy;
+        }
+
+        try {
+            target = parseProxyUrl(target).url;
+        } catch (error) {
+            return res.status(400).json({ success: false, message: error.message });
+        }
+
+        const result = await checkProxy(target);
+        res.json({
+            success: result.ok,
+            message: result.ok ? `Proxy reachable — egress IP ${result.ip}` : `Proxy check failed: ${result.error}`,
+            data: result
         });
     } catch (error) {
         res.status(500).json({
@@ -528,28 +629,85 @@ router.post('/chats/send-poll', checkSession, async (req, res) => {
 });
 
 // ==================== BULK MESSAGING (Background Jobs) ====================
+//
+// All bulk sends run through BulkJobManager: it validates, runs the send loop
+// in the background, emits `bulk.progress` / `bulk.completed` over WebSocket
+// and webhooks, and keeps history in sessions/<id>/bulk-jobs.json.
 
-// Store for bulk message jobs
-const bulkJobs = new Map();
+// Like checkSession, but only requires the session to exist — job history and
+// cancellation must work while the phone is offline.
+const checkSessionExists = (req, res, next) => {
+    const sessionId = req.body?.sessionId || req.query?.sessionId;
 
-// Helper function to generate job ID
-const generateJobId = () => {
-    return `bulk_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    if (!sessionId) {
+        return res.status(400).json({
+            success: false,
+            message: 'Missing required field: sessionId'
+        });
+    }
+
+    const session = whatsappManager.getSession(sessionId);
+
+    if (!session) {
+        return res.status(404).json({
+            success: false,
+            message: 'Session not found'
+        });
+    }
+
+    req.session = session;
+    next();
 };
 
-// Get bulk job status
+// Shared handler: build the job from the request and answer with its id.
+const startBulkJob = (type, buildPayload) => (req, res) => {
+    try {
+        const { recipients, name, delayBetweenMessages, delayJitter, typingTime } = req.body;
+
+        const result = bulkJobManager.createJob(req.session, {
+            type,
+            recipients,
+            name,
+            payload: buildPayload(req.body),
+            options: { delayBetweenMessages, delayJitter, typingTime }
+        });
+
+        if (!result.success) {
+            return res.status(400).json({
+                success: false,
+                message: result.message
+            });
+        }
+
+        res.json({
+            success: true,
+            message: `Bulk ${type} job started. Check status with jobId.`,
+            data: {
+                jobId: result.job.jobId,
+                total: result.job.total,
+                statusUrl: `/api/whatsapp/chats/bulk-status/${result.job.jobId}`
+            }
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
+};
+
+// Get bulk job status (with per-recipient details)
 router.get('/chats/bulk-status/:jobId', (req, res) => {
     try {
-        const { jobId } = req.params;
-        const job = bulkJobs.get(jobId);
-        
+        const job = bulkJobManager.getJob(req.params.jobId);
+
         if (!job) {
             return res.status(404).json({
                 success: false,
                 message: 'Job not found'
             });
         }
-        
+
         res.json({
             success: true,
             data: job
@@ -562,24 +720,105 @@ router.get('/chats/bulk-status/:jobId', (req, res) => {
     }
 });
 
-// Get all bulk jobs for a session
-router.post('/chats/bulk-jobs', checkSession, (req, res) => {
+// Get all bulk jobs for a session (summaries, newest first)
+router.post('/chats/bulk-jobs', checkSessionExists, (req, res) => {
     try {
-        const { sessionId } = req.body;
-        const jobs = [];
-        
-        bulkJobs.forEach((job, jobId) => {
-            if (job.sessionId === sessionId) {
-                jobs.push({ jobId, ...job });
-            }
-        });
-        
-        // Sort by createdAt descending
-        jobs.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-        
         res.json({
             success: true,
-            data: jobs.slice(0, 50) // Return last 50 jobs
+            data: bulkJobManager.listJobs(req.session.sessionId, 50)
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
+});
+
+// Cancel a running bulk job (stops after the send currently in flight)
+router.post('/chats/bulk-jobs/:jobId/cancel', (req, res) => {
+    try {
+        const result = bulkJobManager.cancelJob(req.params.jobId);
+
+        if (!result.success) {
+            return res.status(result.job ? 409 : 404).json({
+                success: false,
+                message: result.message,
+                data: result.job
+            });
+        }
+
+        res.json({
+            success: true,
+            message: result.message,
+            data: result.job
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
+});
+
+// Re-send a finished job to the recipients that did not receive it
+router.post('/chats/bulk-jobs/:jobId/retry', checkSession, (req, res) => {
+    try {
+        const source = bulkJobManager.getJob(req.params.jobId);
+
+        if (!source) {
+            return res.status(404).json({
+                success: false,
+                message: 'Job not found'
+            });
+        }
+
+        if (source.sessionId !== req.session.sessionId) {
+            return res.status(400).json({
+                success: false,
+                message: 'Job belongs to a different session'
+            });
+        }
+
+        if (source.status === 'processing') {
+            return res.status(409).json({
+                success: false,
+                message: 'Job is still running'
+            });
+        }
+
+        const recipients = bulkJobManager.getUnsentRecipients(source.jobId);
+        if (recipients.length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'Nothing to retry — every recipient was sent'
+            });
+        }
+
+        const result = bulkJobManager.createJob(req.session, {
+            type: source.type,
+            recipients,
+            name: source.name ? `${source.name} (retry)` : 'Retry',
+            payload: source.payload,
+            options: source.options
+        });
+
+        if (!result.success) {
+            return res.status(400).json({
+                success: false,
+                message: result.message
+            });
+        }
+
+        res.json({
+            success: true,
+            message: `Retry job started for ${recipients.length} recipient(s).`,
+            data: {
+                jobId: result.job.jobId,
+                total: result.job.total,
+                retryOf: source.jobId,
+                statusUrl: `/api/whatsapp/chats/bulk-status/${result.job.jobId}`
+            }
         });
     } catch (error) {
         res.status(500).json({
@@ -590,345 +829,30 @@ router.post('/chats/bulk-jobs', checkSession, (req, res) => {
 });
 
 // Send bulk text message (Background)
-router.post('/chats/send-bulk', checkSession, async (req, res) => {
-    try {
-        const { recipients, message, delayBetweenMessages = 1000, typingTime = 0 } = req.body;
-        
-        if (!recipients || !Array.isArray(recipients) || recipients.length === 0) {
-            return res.status(400).json({
-                success: false,
-                message: 'Missing required field: recipients (array of phone numbers)'
-            });
-        }
-        
-        if (!message) {
-            return res.status(400).json({
-                success: false,
-                message: 'Missing required field: message'
-            });
-        }
-        
-        if (recipients.length > 100) {
-            return res.status(400).json({
-                success: false,
-                message: 'Maximum 100 recipients per request'
-            });
-        }
-        
-        // Generate job ID and store job info
-        const jobId = generateJobId();
-        const session = req.session;
-        const sessionId = req.body.sessionId;
-        
-        bulkJobs.set(jobId, {
-            sessionId,
-            type: 'text',
-            status: 'processing',
-            total: recipients.length,
-            sent: 0,
-            failed: 0,
-            progress: 0,
-            details: [],
-            createdAt: new Date().toISOString(),
-            completedAt: null
-        });
-        
-        // Respond immediately
-        res.json({
-            success: true,
-            message: 'Bulk message job started. Check status with jobId.',
-            data: {
-                jobId,
-                total: recipients.length,
-                statusUrl: `/api/whatsapp/chats/bulk-status/${jobId}`
-            }
-        });
-        
-        // Process in background (don't await)
-        (async () => {
-            const job = bulkJobs.get(jobId);
-            
-            for (let i = 0; i < recipients.length; i++) {
-                const recipient = recipients[i];
-                try {
-                    const result = await session.sendTextMessage(recipient, message, typingTime);
-                    if (result.success) {
-                        job.sent++;
-                        job.details.push({
-                            recipient,
-                            status: 'sent',
-                            messageId: result.data?.messageId,
-                            timestamp: new Date().toISOString()
-                        });
-                    } else {
-                        job.failed++;
-                        job.details.push({
-                            recipient,
-                            status: 'failed',
-                            error: result.message,
-                            timestamp: new Date().toISOString()
-                        });
-                    }
-                } catch (error) {
-                    job.failed++;
-                    job.details.push({
-                        recipient,
-                        status: 'failed',
-                        error: error.message,
-                        timestamp: new Date().toISOString()
-                    });
-                }
-                
-                job.progress = Math.round(((i + 1) / recipients.length) * 100);
-                
-                // Delay between messages to avoid rate limiting
-                if (i < recipients.length - 1 && delayBetweenMessages > 0) {
-                    await new Promise(resolve => setTimeout(resolve, delayBetweenMessages));
-                }
-            }
-            
-            job.status = 'completed';
-            job.completedAt = new Date().toISOString();
-            
-            // Clean up old jobs (keep last 100)
-            if (bulkJobs.size > 100) {
-                const sortedJobs = [...bulkJobs.entries()]
-                    .sort((a, b) => new Date(b[1].createdAt) - new Date(a[1].createdAt));
-                sortedJobs.slice(100).forEach(([id]) => bulkJobs.delete(id));
-            }
-            
-            console.log(`📤 Bulk job ${jobId} completed. Sent: ${job.sent}, Failed: ${job.failed}`);
-        })();
-        
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            message: error.message
-        });
-    }
-});
+router.post(
+    '/chats/send-bulk',
+    checkSession,
+    startBulkJob('text', ({ message }) => ({ message }))
+);
 
 // Send bulk image message (Background)
-router.post('/chats/send-bulk-image', checkSession, async (req, res) => {
-    try {
-        const { recipients, imageUrl, caption = '', delayBetweenMessages = 1000, typingTime = 0 } = req.body;
-        
-        if (!recipients || !Array.isArray(recipients) || recipients.length === 0) {
-            return res.status(400).json({
-                success: false,
-                message: 'Missing required field: recipients (array of phone numbers)'
-            });
-        }
-        
-        if (!imageUrl) {
-            return res.status(400).json({
-                success: false,
-                message: 'Missing required field: imageUrl'
-            });
-        }
-        
-        if (recipients.length > 100) {
-            return res.status(400).json({
-                success: false,
-                message: 'Maximum 100 recipients per request'
-            });
-        }
-        
-        // Generate job ID and store job info
-        const jobId = generateJobId();
-        const session = req.session;
-        const sessionId = req.body.sessionId;
-        
-        bulkJobs.set(jobId, {
-            sessionId,
-            type: 'image',
-            status: 'processing',
-            total: recipients.length,
-            sent: 0,
-            failed: 0,
-            progress: 0,
-            details: [],
-            createdAt: new Date().toISOString(),
-            completedAt: null
-        });
-        
-        // Respond immediately
-        res.json({
-            success: true,
-            message: 'Bulk image job started. Check status with jobId.',
-            data: {
-                jobId,
-                total: recipients.length,
-                statusUrl: `/api/whatsapp/chats/bulk-status/${jobId}`
-            }
-        });
-        
-        // Process in background
-        (async () => {
-            const job = bulkJobs.get(jobId);
-            
-            for (let i = 0; i < recipients.length; i++) {
-                const recipient = recipients[i];
-                try {
-                    const result = await session.sendImage(recipient, imageUrl, caption, typingTime);
-                    if (result.success) {
-                        job.sent++;
-                        job.details.push({
-                            recipient,
-                            status: 'sent',
-                            messageId: result.data?.messageId,
-                            timestamp: new Date().toISOString()
-                        });
-                    } else {
-                        job.failed++;
-                        job.details.push({
-                            recipient,
-                            status: 'failed',
-                            error: result.message,
-                            timestamp: new Date().toISOString()
-                        });
-                    }
-                } catch (error) {
-                    job.failed++;
-                    job.details.push({
-                        recipient,
-                        status: 'failed',
-                        error: error.message,
-                        timestamp: new Date().toISOString()
-                    });
-                }
-                
-                job.progress = Math.round(((i + 1) / recipients.length) * 100);
-                
-                if (i < recipients.length - 1 && delayBetweenMessages > 0) {
-                    await new Promise(resolve => setTimeout(resolve, delayBetweenMessages));
-                }
-            }
-            
-            job.status = 'completed';
-            job.completedAt = new Date().toISOString();
-            
-            console.log(`📤 Bulk image job ${jobId} completed. Sent: ${job.sent}, Failed: ${job.failed}`);
-        })();
-        
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            message: error.message
-        });
-    }
-});
+router.post(
+    '/chats/send-bulk-image',
+    checkSession,
+    startBulkJob('image', ({ imageUrl, caption }) => ({ imageUrl, caption }))
+);
 
 // Send bulk document message (Background)
-router.post('/chats/send-bulk-document', checkSession, async (req, res) => {
-    try {
-        const { recipients, documentUrl, filename, mimetype, delayBetweenMessages = 1000, typingTime = 0 } = req.body;
-        
-        if (!recipients || !Array.isArray(recipients) || recipients.length === 0) {
-            return res.status(400).json({
-                success: false,
-                message: 'Missing required field: recipients (array of phone numbers)'
-            });
-        }
-        
-        if (!documentUrl || !filename) {
-            return res.status(400).json({
-                success: false,
-                message: 'Missing required fields: documentUrl, filename'
-            });
-        }
-        
-        if (recipients.length > 100) {
-            return res.status(400).json({
-                success: false,
-                message: 'Maximum 100 recipients per request'
-            });
-        }
-        
-        // Generate job ID and store job info
-        const jobId = generateJobId();
-        const session = req.session;
-        const sessionId = req.body.sessionId;
-        
-        bulkJobs.set(jobId, {
-            sessionId,
-            type: 'document',
-            status: 'processing',
-            total: recipients.length,
-            sent: 0,
-            failed: 0,
-            progress: 0,
-            details: [],
-            createdAt: new Date().toISOString(),
-            completedAt: null
-        });
-        
-        // Respond immediately
-        res.json({
-            success: true,
-            message: 'Bulk document job started. Check status with jobId.',
-            data: {
-                jobId,
-                total: recipients.length,
-                statusUrl: `/api/whatsapp/chats/bulk-status/${jobId}`
-            }
-        });
-        
-        // Process in background
-        (async () => {
-            const job = bulkJobs.get(jobId);
-            
-            for (let i = 0; i < recipients.length; i++) {
-                const recipient = recipients[i];
-                try {
-                    const result = await session.sendDocument(recipient, documentUrl, filename, mimetype, typingTime);
-                    if (result.success) {
-                        job.sent++;
-                        job.details.push({
-                            recipient,
-                            status: 'sent',
-                            messageId: result.data?.messageId,
-                            timestamp: new Date().toISOString()
-                        });
-                    } else {
-                        job.failed++;
-                        job.details.push({
-                            recipient,
-                            status: 'failed',
-                            error: result.message,
-                            timestamp: new Date().toISOString()
-                        });
-                    }
-                } catch (error) {
-                    job.failed++;
-                    job.details.push({
-                        recipient,
-                        status: 'failed',
-                        error: error.message,
-                        timestamp: new Date().toISOString()
-                    });
-                }
-                
-                job.progress = Math.round(((i + 1) / recipients.length) * 100);
-                
-                if (i < recipients.length - 1 && delayBetweenMessages > 0) {
-                    await new Promise(resolve => setTimeout(resolve, delayBetweenMessages));
-                }
-            }
-            
-            job.status = 'completed';
-            job.completedAt = new Date().toISOString();
-            
-            console.log(`📤 Bulk document job ${jobId} completed. Sent: ${job.sent}, Failed: ${job.failed}`);
-        })();
-        
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            message: error.message
-        });
-    }
-});
+router.post(
+    '/chats/send-bulk-document',
+    checkSession,
+    startBulkJob('document', ({ documentUrl, filename, mimetype, caption }) => ({
+        documentUrl,
+        filename,
+        mimetype,
+        caption
+    }))
+);
 
 // Send presence update (typing indicator)
 router.post('/chats/presence', checkSession, async (req, res) => {
