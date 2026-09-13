@@ -1007,6 +1007,40 @@ Returns the last 50 jobs for the session, newest first, without the per-recipien
 
 ---
 
+### Scrapers & Address Book
+
+#### Scrape Contacts
+```http
+POST /contacts/scrape
+```
+Body: `{ "sessionIds": ["accountA","accountB"], "dedupe": true }` (or a single `sessionId`). Returns every saved contact across the selected connected accounts. With `dedupe` (default), a number seen on several accounts appears once with a `sources` array. The dashboard's **Scrapers → Contact Scraper** exports the result to CSV.
+
+#### List Groups
+```http
+POST /groups/list
+```
+Body: `{ "sessionId": "accountA" }` — the account's groups, for picking before a group scrape.
+
+#### Scrape Group Members
+```http
+POST /groups/scrape
+```
+Body: `{ "sessionId": "accountA", "groupIds": ["<jid>", "<jid>"] }` for chosen groups, or omit `groupIds` to scrape **all** groups on the account. `sessionIds` works too for several accounts at once. Each member row has `phone`, `name` (if known), `admin`, and `groupName`.
+
+#### Save a Contact
+```http
+POST /contacts/save
+```
+Body: `{ "sessionId", "phone", "name" }` — saves the number to that account's WhatsApp address book (app-state sync, `saveOnPrimaryAddressbook`).
+
+#### Add Contacts to a Group
+```http
+POST /contacts/add-to-group
+```
+Body: `{ "sessionId", "groupId", "phones": ["628...","628..."], "name" }` (or a single `phone`). For each number it **saves the contact first, then adds it to the group** — the flow point (3) asks for. Returns a per-number result; `success` is true when at least one was added.
+
+> Group adds are subject to WhatsApp's rules: you must be an admin of the group, and numbers with "only contacts/admins can add me" privacy will land as an invite rather than a direct add (reflected in each result's status).
+
 ### Chat History
 
 #### Get Chats Overview

@@ -1173,6 +1173,202 @@ router.post('/chats/overview', checkSession, async (req, res) => {
     }
 });
 
+// ==================== SCRAPERS & ADD-TO-GROUP ====================
+//
+// Contact/group scraping and add-to-group can span one or many accounts.
+// `sessionIds` (array) selects the accounts; a single `sessionId` also works.
+
+// Resolve the accounts to operate on: connected ones become `req.accounts`,
+// the rest are reported. Used by the scraper endpoints.
+const resolveAccounts = (req, res, next) => {
+    const body = req.body || {};
+    let ids = Array.isArray(body.sessionIds) && body.sessionIds.length
+        ? body.sessionIds
+        : (body.sessionId ? [body.sessionId] : []);
+    ids = [...new Set(ids.filter((x) => typeof x === 'string' && x.trim()).map((x) => x.trim()))];
+
+    if (ids.length === 0) {
+        return res.status(400).json({ success: false, message: 'Missing required field: sessionIds (array) or sessionId' });
+    }
+
+    const accounts = [];
+    const skipped = [];
+    for (const id of ids) {
+        const session = whatsappManager.getSession(id);
+        if (!session) skipped.push({ sessionId: id, reason: 'not found' });
+        else if (session.connectionStatus !== 'connected') skipped.push({ sessionId: id, reason: session.connectionStatus });
+        else accounts.push(session);
+    }
+
+    if (accounts.length === 0) {
+        return res.status(400).json({
+            success: false,
+            message: 'No connected account for this request',
+            data: { skipped }
+        });
+    }
+
+    req.accounts = accounts;
+    req.accountsSkipped = skipped;
+    next();
+};
+
+/** De-duplicate scraped contacts by phone, merging which accounts/groups saw each. */
+function dedupeContacts(rows) {
+    const byPhone = new Map();
+    for (const row of rows) {
+        const key = row.phone;
+        if (!key) continue;
+        const existing = byPhone.get(key);
+        if (!existing) {
+            byPhone.set(key, {
+                phone: row.phone,
+                jid: row.jid,
+                name: row.name || null,
+                sources: [row.sessionId],
+                groups: row.groupName ? [row.groupName] : undefined
+            });
+        } else {
+            if (!existing.name && row.name) existing.name = row.name;
+            if (!existing.sources.includes(row.sessionId)) existing.sources.push(row.sessionId);
+            if (row.groupName) {
+                existing.groups = existing.groups || [];
+                if (!existing.groups.includes(row.groupName)) existing.groups.push(row.groupName);
+            }
+        }
+    }
+    return [...byPhone.values()];
+}
+
+// Scrape saved contacts from one or many accounts.
+// Body: { sessionIds[] | sessionId, dedupe? (default true), includeProfilePicture? }
+router.post('/contacts/scrape', resolveAccounts, async (req, res) => {
+    try {
+        const { dedupe = true, includeProfilePicture = false } = req.body;
+        const perAccount = [];
+        let rows = [];
+
+        for (const account of req.accounts) {
+            const result = await account.scrapeContacts({ includeProfilePicture });
+            const contacts = result.success ? result.data.contacts : [];
+            perAccount.push({
+                sessionId: account.sessionId,
+                accountName: account.name || account.sessionId,
+                total: contacts.length,
+                error: result.success ? undefined : result.message
+            });
+            rows = rows.concat(contacts);
+        }
+
+        const contacts = dedupe ? dedupeContacts(rows) : rows;
+        res.json({
+            success: true,
+            data: {
+                total: contacts.length,
+                accounts: perAccount,
+                skipped: req.accountsSkipped.length ? req.accountsSkipped : undefined,
+                deduped: Boolean(dedupe),
+                contacts
+            }
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// List an account's groups (to pick from before a group scrape / add-to-group).
+// Body: { sessionId }
+router.post('/groups/list', checkSession, async (req, res) => {
+    try {
+        const result = await req.session.getChats(); // { groups: [...] }
+        res.json(result);
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// Scrape members of groups. Body: { sessionIds[] | sessionId, groupIds? (omit = all
+// groups on each account), dedupe? (default true) }.
+router.post('/groups/scrape', resolveAccounts, async (req, res) => {
+    try {
+        const { groupIds = null, dedupe = true } = req.body;
+        if (groupIds !== null && !Array.isArray(groupIds)) {
+            return res.status(400).json({ success: false, message: 'groupIds must be an array (or omitted for all groups)' });
+        }
+
+        const perAccount = [];
+        const groups = [];
+        let rows = [];
+        for (const account of req.accounts) {
+            const result = await account.scrapeGroupContacts(groupIds);
+            if (result.success) {
+                perAccount.push({ sessionId: account.sessionId, accountName: account.name || account.sessionId, groups: result.data.groups.length, members: result.data.contacts.length });
+                for (const g of result.data.groups) groups.push({ ...g, sessionId: account.sessionId });
+                rows = rows.concat(result.data.contacts);
+            } else {
+                perAccount.push({ sessionId: account.sessionId, error: result.message });
+            }
+        }
+
+        const contacts = dedupe ? dedupeContacts(rows) : rows;
+        res.json({
+            success: true,
+            data: {
+                total: contacts.length,
+                groups,
+                accounts: perAccount,
+                skipped: req.accountsSkipped.length ? req.accountsSkipped : undefined,
+                deduped: Boolean(dedupe),
+                contacts
+            }
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// Save a number to an account's address book (without adding to a group).
+// Body: { sessionId, phone, name? }
+router.post('/contacts/save', checkSession, async (req, res) => {
+    try {
+        const { phone, name } = req.body;
+        if (!phone) {
+            return res.status(400).json({ success: false, message: 'Missing required field: phone' });
+        }
+        const result = await req.session.saveContact(phone, name || '');
+        res.status(result.success ? 200 : 400).json(result);
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// Save a contact, then add it to a group. Accepts one `phone` or many `phones`.
+// Body: { sessionId, groupId, phone? | phones[], name? }
+router.post('/contacts/add-to-group', checkSession, async (req, res) => {
+    try {
+        const { groupId, phone, phones, name } = req.body;
+        const list = Array.isArray(phones) && phones.length ? phones : (phone ? [phone] : []);
+
+        if (!groupId || list.length === 0) {
+            return res.status(400).json({ success: false, message: 'Missing required fields: groupId and phone (or phones[])' });
+        }
+
+        const results = [];
+        for (const p of list) {
+            results.push({ phone: p, ...(await req.session.addContactToGroup(groupId, p, name || '')) });
+        }
+
+        const added = results.filter((r) => r.success).length;
+        res.json({
+            success: added > 0,
+            message: `Added ${added}/${list.length} to the group`,
+            data: { groupId, added, failed: list.length - added, results }
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
 /**
  * Get contacts list - semua kontak yang tersimpan
  * Body: { sessionId, limit?, offset?, search? }

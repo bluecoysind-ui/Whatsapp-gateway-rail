@@ -141,7 +141,7 @@ export function mediaTypeForFile(file: File, asDocument = false): BubbleMediaTyp
   return "document";
 }
 
-type NavId = "chats" | "contacts" | "groups" | "broadcast" | "tools" | "settings";
+type NavId = "chats" | "contacts" | "groups" | "broadcast" | "scrapers" | "tools" | "settings";
 type Filter = "all" | "unread" | "groups";
 type Overlay = null | "qr" | "create-session" | "webhooks" | "proxy" | "bulk" | "templates" | "search";
 

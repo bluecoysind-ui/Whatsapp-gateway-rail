@@ -1628,6 +1628,141 @@
 
 /**
  * @swagger
+ * /api/whatsapp/contacts/scrape:
+ *   post:
+ *     tags: [Scrapers]
+ *     summary: Scrape saved contacts from one or many accounts
+ *     description: Returns every contact the selected accounts know. With `dedupe` (default true), duplicates across accounts are merged and each carries a `sources` array.
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               sessionIds:
+ *                 type: array
+ *                 items: { type: string }
+ *                 example: ["accountA", "accountB"]
+ *               sessionId:
+ *                 type: string
+ *                 description: A single account (alternative to sessionIds)
+ *               dedupe:
+ *                 type: boolean
+ *                 default: true
+ *     responses:
+ *       200:
+ *         description: Contacts scraped
+ *       400:
+ *         description: No connected account
+ */
+
+/**
+ * @swagger
+ * /api/whatsapp/groups/list:
+ *   post:
+ *     tags: [Scrapers]
+ *     summary: List an account's groups (to choose before scraping)
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [sessionId]
+ *             properties:
+ *               sessionId: { type: string }
+ *     responses:
+ *       200:
+ *         description: Groups
+ */
+
+/**
+ * @swagger
+ * /api/whatsapp/groups/scrape:
+ *   post:
+ *     tags: [Scrapers]
+ *     summary: Scrape members of groups (single, multiple, or all)
+ *     description: Pass `groupIds` to scrape specific groups, or omit it to scrape every group on each selected account.
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               sessionIds:
+ *                 type: array
+ *                 items: { type: string }
+ *               sessionId:
+ *                 type: string
+ *               groupIds:
+ *                 type: array
+ *                 items: { type: string }
+ *                 description: Omit for all groups on each account
+ *               dedupe:
+ *                 type: boolean
+ *                 default: true
+ *     responses:
+ *       200:
+ *         description: Members scraped
+ *       400:
+ *         description: No connected account, or groupIds not an array
+ */
+
+/**
+ * @swagger
+ * /api/whatsapp/contacts/save:
+ *   post:
+ *     tags: [Scrapers]
+ *     summary: Save a number to an account's address book
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [sessionId, phone]
+ *             properties:
+ *               sessionId: { type: string }
+ *               phone: { type: string, example: "628123456789" }
+ *               name: { type: string }
+ *     responses:
+ *       200:
+ *         description: Saved
+ */
+
+/**
+ * @swagger
+ * /api/whatsapp/contacts/add-to-group:
+ *   post:
+ *     tags: [Scrapers]
+ *     summary: Save contact(s), then add them to a group
+ *     description: Each number is saved to the account's address book first, then added to the group. Accepts a single `phone` or a `phones` array.
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [sessionId, groupId]
+ *             properties:
+ *               sessionId: { type: string }
+ *               groupId: { type: string, example: "12036...@g.us" }
+ *               phone: { type: string }
+ *               phones:
+ *                 type: array
+ *                 items: { type: string }
+ *               name: { type: string }
+ *     responses:
+ *       200:
+ *         description: Per-number result (success is true when at least one was added)
+ *       400:
+ *         description: Missing groupId or phone(s)
+ */
+
+/**
+ * @swagger
  * /api/whatsapp/contacts:
  *   post:
  *     tags: [Chat History]

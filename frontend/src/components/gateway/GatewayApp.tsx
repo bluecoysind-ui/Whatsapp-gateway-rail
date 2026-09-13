@@ -6,6 +6,7 @@ import { cn } from "@/lib/cn";
 import { useGateway } from "@/store/gateway-store";
 import { Overlays, Toasts, ToolsPanel } from "./Overlays";
 import { BroadcastPanel } from "./Broadcast";
+import { ScrapersPanel } from "./Scrapers";
 import Aurora from "./Aurora";
 import {
   IconBell,
@@ -187,6 +188,7 @@ function AccountsRail() {
     });
   };
   const items = [
+    { id: "scrapers" as const, label: "Scrapers", icon: <IconUsers /> },
     { id: "tools" as const, label: "Tools", icon: <IconTools /> },
     { id: "settings" as const, label: "Settings", icon: <IconGear /> },
   ];
@@ -291,6 +293,7 @@ function MainStage() {
   if (nav === "contacts") return <Directory title="Contacts" kind="dm" />;
   if (nav === "groups") return <Directory title="Groups" kind="group" />;
   if (nav === "broadcast") return <BroadcastPanel />;
+  if (nav === "scrapers") return <ScrapersPanel />;
   return (
     <div className="flex min-h-0 min-w-0 flex-1 gap-3">
       <div className={cn("h-full w-full max-w-[320px] shrink-0", mobilePane !== "list" && "hidden lg:block")}>

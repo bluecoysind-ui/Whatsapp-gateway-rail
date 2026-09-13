@@ -404,6 +404,7 @@ export function ToolsPanel() {
                 { id: "contacts" as const, label: "Contacts" },
                 { id: "groups" as const, label: "Groups" },
                 { id: "broadcast" as const, label: "Broadcast" },
+                { id: "scrapers" as const, label: "Scrapers" },
               ]
             ).map((s) => (
               <button

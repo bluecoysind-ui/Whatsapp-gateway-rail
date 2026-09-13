@@ -61,6 +61,7 @@ All API endpoints require \`X-Api-Key\` header (if API_KEY is configured in .env
             { name: 'Sessions', description: 'WhatsApp session management' },
             { name: 'Messaging', description: 'Send messages (text, image, document, etc.)' },
             { name: 'Bulk Messaging', description: 'Send bulk messages to multiple recipients (max 100 per request)' },
+            { name: 'Scrapers', description: 'Scrape contacts/group members and add contacts to groups' },
             { name: 'Chat History', description: 'Get chats, messages, contacts' },
             { name: 'Groups', description: 'Group management operations' },
             { name: 'WebSocket', description: 'WebSocket connection info' }

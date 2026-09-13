@@ -1601,6 +1601,170 @@ class WhatsAppSession {
         }
     }
 
+    // ==================== SCRAPERS & ADDRESS BOOK ====================
+
+    /**
+     * Every contact this account knows, for the contact scraper (no pagination).
+     * @param {Object} [opts] - { includeProfilePicture?: boolean }
+     */
+    async scrapeContacts(opts = {}) {
+        try {
+            if (!this.store) {
+                return { success: false, message: 'Store not initialized' };
+            }
+            const { data } = this.store.getContactsFast({ limit: Number.MAX_SAFE_INTEGER, offset: 0, search: '' });
+            const contacts = data.map((c) => ({
+                jid: c.id,
+                phone: c.id.split('@')[0],
+                name: c.name || null,
+                pushName: c.notify || null,
+                verifiedName: c.verifiedName || null,
+                profilePicture: opts.includeProfilePicture ? c.profilePicture || null : undefined,
+                sessionId: this.sessionId,
+                accountName: this.name || this.sessionId,
+                accountPhone: this.phoneNumber || null
+            }));
+            return { success: true, data: { total: contacts.length, contacts } };
+        } catch (error) {
+            return { success: false, message: error.message };
+        }
+    }
+
+    /**
+     * Scrape the members of one or more groups on this account.
+     * @param {string[]|null} groupIds - specific groups, or null/[] for all groups the account is in
+     */
+    async scrapeGroupContacts(groupIds = null) {
+        try {
+            if (!this.socket || this.connectionStatus !== 'connected') {
+                return { success: false, message: 'Session not connected' };
+            }
+
+            let targets;
+            if (Array.isArray(groupIds) && groupIds.length > 0) {
+                targets = groupIds.map((g) => this.formatJid(g, true));
+            } else {
+                const all = await this.socket.groupFetchAllParticipating();
+                targets = Object.keys(all);
+            }
+
+            const groups = [];
+            const contacts = [];
+            const errors = [];
+            for (const gid of targets) {
+                let metadata;
+                try {
+                    metadata = await this.socket.groupMetadata(gid);
+                } catch (e) {
+                    errors.push({ groupId: gid, error: e.message });
+                    continue;
+                }
+                groups.push({ id: metadata.id, name: metadata.subject, participantsCount: metadata.participants.length });
+                for (const part of metadata.participants) {
+                    let jid = part.id;
+                    if (jid.endsWith('@lid') && this.store) {
+                        const identity = this.store.resolveIdentity(jid);
+                        if (identity && identity.jid) jid = identity.jid;
+                    }
+                    const known = this.store ? this.store.getContact(jid) : null;
+                    contacts.push({
+                        jid,
+                        phone: jid.split('@')[0],
+                        name: (known && (known.name || known.notify)) || null,
+                        admin: part.admin || null,
+                        groupId: metadata.id,
+                        groupName: metadata.subject,
+                        sessionId: this.sessionId,
+                        accountName: this.name || this.sessionId
+                    });
+                }
+            }
+
+            return { success: true, data: { groups, contacts, errors: errors.length ? errors : undefined } };
+        } catch (error) {
+            return { success: false, message: error.message };
+        }
+    }
+
+    /**
+     * Save a number to this account's address book (WhatsApp app-state sync),
+     * so it shows up as a saved contact before being added to a group.
+     */
+    async saveContact(phone, name = '') {
+        try {
+            if (!this.socket || this.connectionStatus !== 'connected') {
+                return { success: false, message: 'Session not connected' };
+            }
+            const jid = this.formatJid(phone, false);
+            const displayName = (name && name.trim()) || jid.split('@')[0];
+
+            if (typeof this.socket.addOrEditContact !== 'function') {
+                return { success: false, message: 'This Baileys build cannot save contacts' };
+            }
+
+            await this.socket.addOrEditContact(jid, {
+                fullName: displayName,
+                firstName: displayName,
+                saveOnPrimaryAddressbook: true,
+                pnJid: jid
+            });
+
+            if (this.store) {
+                const existing = this.store.contacts.get(jid) || { id: jid };
+                this.store.contacts.set(jid, { ...existing, id: jid, name: displayName });
+            }
+
+            return {
+                success: true,
+                message: 'Contact saved',
+                data: { jid, phone: jid.split('@')[0], name: displayName }
+            };
+        } catch (error) {
+            return { success: false, message: error.message };
+        }
+    }
+
+    /**
+     * Save a number as a contact, then add it to a group. Point (3): the number
+     * is saved on the account first, then the group add is attempted.
+     */
+    async addContactToGroup(groupId, phone, name = '') {
+        try {
+            if (!this.socket || this.connectionStatus !== 'connected') {
+                return { success: false, message: 'Session not connected' };
+            }
+            if (!groupId || !phone) {
+                return { success: false, message: 'groupId and phone are required' };
+            }
+
+            const saved = await this.saveContact(phone, name);
+
+            const gid = this.formatJid(groupId, true);
+            const jid = this.formatJid(phone, false);
+            const result = await this.socket.groupParticipantsUpdate(gid, [jid], 'add');
+
+            const entry = Array.isArray(result) ? result[0] : null;
+            const code = entry && entry.status ? String(entry.status) : '200';
+            const ok = code === '200';
+
+            return {
+                success: ok,
+                message: ok ? 'Contact saved and added to group' : `Saved, but group add returned status ${code}`,
+                data: {
+                    groupId: gid,
+                    phone: jid.split('@')[0],
+                    jid,
+                    contactSaved: saved.success,
+                    contactSaveError: saved.success ? undefined : saved.message,
+                    addStatus: code,
+                    result
+                }
+            };
+        } catch (error) {
+            return { success: false, message: error.message };
+        }
+    }
+
     // ==================== GROUPS ====================
 
     async getChats() {

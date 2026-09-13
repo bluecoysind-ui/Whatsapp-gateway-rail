@@ -1,1 +1,0 @@
-import{t as e}from"./GatewayApp-DYpI_KPE.js";var t=e;export{t as component};

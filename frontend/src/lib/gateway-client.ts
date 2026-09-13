@@ -498,6 +498,108 @@ export type GatewayMessage = {
   isGroup?: boolean;
 };
 
+// ---------------------------------------------------------------------------
+// Scrapers & address book (backend: /contacts/scrape, /groups/scrape,
+// /groups/list, /contacts/save, /contacts/add-to-group)
+// ---------------------------------------------------------------------------
+
+/** A scraped contact (deduped rows carry `sources`/`groups`). */
+export type ScrapedContact = {
+  phone: string;
+  jid: string;
+  name: string | null;
+  admin?: string | null;
+  groupName?: string;
+  sessionId?: string;
+  accountName?: string;
+  sources?: string[];
+  groups?: string[];
+};
+
+export type ScrapeAccountStat = { sessionId: string; accountName?: string; total?: number; groups?: number; members?: number; error?: string };
+export type GroupRow = { id: string; name: string; participantsCount?: number; sessionId?: string; desc?: string | null };
+
+export async function scrapeContacts(sessionIds: string[], opts: { dedupe?: boolean } = {}) {
+  const response = await apiFetch(`${API_BASE}/contacts/scrape`, {
+    method: "POST",
+    body: JSON.stringify({ sessionIds, dedupe: opts.dedupe ?? true }),
+  });
+  return response.json() as Promise<{
+    success: boolean;
+    message?: string;
+    data?: { total: number; contacts: ScrapedContact[]; accounts: ScrapeAccountStat[]; skipped?: Array<{ sessionId: string; reason: string }>; deduped: boolean };
+  }>;
+}
+
+export async function listGroups(sessionId: string) {
+  const response = await apiFetch(`${API_BASE}/groups/list`, {
+    method: "POST",
+    body: JSON.stringify({ sessionId }),
+  });
+  return response.json() as Promise<{ success: boolean; message?: string; data?: { groups: GroupRow[]; totalGroups: number } }>;
+}
+
+/** `groupIds` omitted = every group on each account. */
+export async function scrapeGroups(sessionIds: string[], groupIds: string[] | null, opts: { dedupe?: boolean } = {}) {
+  const response = await apiFetch(`${API_BASE}/groups/scrape`, {
+    method: "POST",
+    body: JSON.stringify({ sessionIds, groupIds, dedupe: opts.dedupe ?? true }),
+  });
+  return response.json() as Promise<{
+    success: boolean;
+    message?: string;
+    data?: { total: number; contacts: ScrapedContact[]; groups: GroupRow[]; accounts: ScrapeAccountStat[]; skipped?: Array<{ sessionId: string; reason: string }>; deduped: boolean };
+  }>;
+}
+
+export async function saveContact(sessionId: string, phone: string, name?: string) {
+  const response = await apiFetch(`${API_BASE}/contacts/save`, {
+    method: "POST",
+    body: JSON.stringify({ sessionId, phone, name }),
+  });
+  return response.json() as Promise<{ success: boolean; message?: string; data?: { jid: string; phone: string; name: string } }>;
+}
+
+export type AddToGroupResult = { phone: string; success: boolean; message?: string; data?: { addStatus?: string; contactSaved?: boolean; contactSaveError?: string } };
+
+/** Saves each number as a contact, then adds it to the group. */
+export async function addContactsToGroup(input: { sessionId: string; groupId: string; phones: string[]; name?: string }) {
+  const response = await apiFetch(`${API_BASE}/contacts/add-to-group`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+  return response.json() as Promise<{
+    success: boolean;
+    message?: string;
+    data?: { groupId: string; added: number; failed: number; results: AddToGroupResult[] };
+  }>;
+}
+
+/** Trigger a client-side CSV download of scraped rows (works in the artifact/browser). */
+export function downloadContactsCsv(rows: ScrapedContact[], filename: string) {
+  const header = ["phone", "name", "jid", "groups", "sources"];
+  const escape = (v: string) => (/[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v);
+  const lines = [header.join(",")];
+  for (const r of rows) {
+    lines.push([
+      r.phone ?? "",
+      r.name ?? "",
+      r.jid ?? "",
+      (r.groups ?? (r.groupName ? [r.groupName] : [])).join(" | "),
+      (r.sources ?? (r.sessionId ? [r.sessionId] : [])).join(" | "),
+    ].map((v) => escape(String(v))).join(","));
+  }
+  const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
 export async function listChats(sessionId: string, limit = 50, offset = 0) {
   const response = await apiFetch(`${API_BASE}/chats/overview`, {
     method: "POST",
