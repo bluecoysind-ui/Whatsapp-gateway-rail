@@ -14,6 +14,18 @@ export type SessionStatus =
   | "qr_expired"
   | "logged_out";
 
+/** Initial history-sync progress reported by the gateway. */
+export type SyncState = {
+  active: boolean;
+  progress: number;
+  isLatest: boolean;
+  chats: number;
+  contacts: number;
+  messages: number;
+  startedAt: number | null;
+  updatedAt: number | null;
+};
+
 export type GatewaySession = {
   sessionId: string;
   name?: string;
@@ -22,6 +34,8 @@ export type GatewaySession = {
   webhooks?: Array<{ url: string; events?: string[] }>;
   /** Redacted proxy URL (password masked) the session connects through, or null. */
   proxy?: string | null;
+  /** History-sync progress; `active` while WhatsApp is still pushing history. */
+  sync?: SyncState | null;
 };
 
 export type GatewayEvent = {

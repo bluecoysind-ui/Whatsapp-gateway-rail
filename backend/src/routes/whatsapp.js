@@ -86,7 +86,8 @@ router.get('/sessions', (req, res) => {
                 name: s.name,
                 webhooks: s.webhooks || [],
                 metadata: s.metadata || {},
-                proxy: s.proxy || null
+                proxy: s.proxy || null,
+                sync: s.sync || null
             }))
         });
     } catch (error) {
@@ -153,7 +154,8 @@ router.get('/sessions/:sessionId/status', (req, res) => {
                 name: info.name,
                 metadata: info.metadata,
                 webhooks: info.webhooks,
-                proxy: info.proxy
+                proxy: info.proxy,
+                sync: info.sync || null
             }
         });
     } catch (error) {

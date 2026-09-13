@@ -34,14 +34,21 @@ const CHATS_PAGE = 30;
 const MESSAGES_PAGE = 40;
 /** How often the dashboard re-reads session status (there is no push channel). */
 const SESSION_REFRESH_MS = 10_000;
+/** Faster poll while a history sync is in progress, so the progress bar moves. */
+const SYNC_REFRESH_MS = 2_000;
 /** How often the open conversation / chat list are refreshed while the inbox is on screen. */
 const INBOX_REFRESH_MS = 8_000;
 
 /** WhatsApp timestamps are seconds; the UI wants a short local clock. */
 function clockFrom(ts: number | undefined): string {
-  if (!ts) return "";
-  const ms = ts > 1e12 ? ts : ts * 1000;
-  return new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  // The backend normalizes to Unix seconds, but guard anyway: coerce, reject
+  // non-finite/≤0, and never let an invalid Date render as "Invalid Date".
+  const n = typeof ts === "number" ? ts : Number(ts);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  const ms = n > 1e12 ? n : n * 1000;
+  const d = new Date(ms);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 }
 
 function initialsFrom(name: string): string {
@@ -240,7 +247,7 @@ let qrWatchTimer: ReturnType<typeof setInterval> | null = null;
 let bulkWatchTimer: ReturnType<typeof setInterval> | null = null;
 
 /** Background timers: session status, and the open inbox. Started once by init(). */
-let sessionRefreshTimer: ReturnType<typeof setInterval> | null = null;
+let sessionRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 let inboxRefreshTimer: ReturnType<typeof setInterval> | null = null;
 
 /**
@@ -347,8 +354,14 @@ export const useGateway = create<State>((set, get) => ({
     }
 
     // Plain polling keeps the rail and the open inbox current — no push channel needed.
+    // Self-rescheduling poll: 2s while any account is syncing history, else 10s.
     if (!sessionRefreshTimer) {
-      sessionRefreshTimer = setInterval(() => void get().refreshSessions(), SESSION_REFRESH_MS);
+      const tick = async () => {
+        await get().refreshSessions();
+        const syncing = get().sessions.some((s) => s.sync?.active);
+        sessionRefreshTimer = setTimeout(tick, syncing ? SYNC_REFRESH_MS : SESSION_REFRESH_MS);
+      };
+      sessionRefreshTimer = setTimeout(tick, SESSION_REFRESH_MS);
     }
     if (!inboxRefreshTimer) {
       inboxRefreshTimer = setInterval(() => {
@@ -382,6 +395,12 @@ export const useGateway = create<State>((set, get) => ({
         s,
       );
       if (line) get().pushEvent("connection", line);
+      // Announce when a history sync finishes so the chat list reloads.
+      const b = before.find((x) => x.sessionId === s.sessionId);
+      if (b?.sync?.active && s.sync && !s.sync.active) {
+        get().pushEvent("connection", `${s.name || s.sessionId}: history synced (${s.sync.chats} chats, ${s.sync.messages} messages)`);
+        if (s.sessionId === get().activeAccountId) void get().loadChats();
+      }
     }
     const activeId = get().activeAccountId;
     const activeBefore = before.find((s) => s.sessionId === activeId);

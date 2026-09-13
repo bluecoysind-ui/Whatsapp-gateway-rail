@@ -10,9 +10,8 @@ const wsManager = require('../websocket/WebSocketManager');
 const { buildProxyAgents, redactProxyUrl } = require('./proxy');
 const sessionEvents = require('./sessionEvents');
 
-/** How long a QR pairing window stays open before the session is revoked (ms). */
 const QR_EXPIRY_MS = Number(process.env.QR_EXPIRY_MS) || 120_000;
-/** Incoming media above this size is not downloaded automatically (fetched on demand instead). */
+/** Incoming media above this size is fetched on demand instead of auto-saved. */
 const MEDIA_AUTOSAVE_MAX_BYTES = Number(process.env.MEDIA_AUTOSAVE_MAX_BYTES) || 25 * 1024 * 1024;
 
 /**
@@ -36,20 +35,18 @@ class WhatsAppSession {
         this.qrTimer = null;
         this.qrExpired = false;
         this.qrExpiresAt = null;
-        // messageId -> /media/... path for media we sent from a local file, applied
-        // when the echo of our own message lands in the store.
-        this._pendingMediaPaths = new Map();
-        
+
         // Custom metadata and webhook
         this.metadata = options.metadata || {};
         this.webhooks = options.webhooks || []; // Array of { url, events? }
-        // Proxy URL (socks5:// or http://) every connection of this session goes through
         this.proxy = options.proxy || null;
-        
+        // messageId -> /media/... path for media we sent from a local file.
+        this._pendingMediaPaths = new Map();
+
         // Load config if exists
         this._loadConfig();
     }
-    
+
     /**
      * Load session config from file
      */
@@ -65,7 +62,7 @@ class WhatsAppSession {
             console.log(`⚠️ [${this.sessionId}] Could not load config:`, e.message);
         }
     }
-    
+
     /**
      * Save session config to file
      */
@@ -83,7 +80,7 @@ class WhatsAppSession {
             console.log(`⚠️ [${this.sessionId}] Could not save config:`, e.message);
         }
     }
-    
+
     /**
      * Update session config
      */
@@ -100,7 +97,7 @@ class WhatsAppSession {
         this._saveConfig();
         return this.getInfo();
     }
-    
+
     /**
      * Add a webhook URL
      */
@@ -115,7 +112,7 @@ class WhatsAppSession {
         this._saveConfig();
         return this.getInfo();
     }
-    
+
     /**
      * Remove a webhook URL
      */
@@ -124,13 +121,13 @@ class WhatsAppSession {
         this._saveConfig();
         return this.getInfo();
     }
-    
+
     /**
      * Send webhook notification to all configured webhook URLs
      */
     async _sendWebhook(event, data) {
         if (!this.webhooks || this.webhooks.length === 0) return;
-        
+
         const payload = {
             event,
             sessionId: this.sessionId,
@@ -138,7 +135,7 @@ class WhatsAppSession {
             data,
             timestamp: new Date().toISOString()
         };
-        
+
         // Send to all webhooks in parallel
         const promises = this.webhooks.map(async (webhook) => {
             // Check if event should be sent to this webhook
@@ -146,7 +143,7 @@ class WhatsAppSession {
             if (!events.includes('all') && !events.includes(event)) {
                 return;
             }
-            
+
             try {
                 const response = await fetch(webhook.url, {
                     method: 'POST',
@@ -158,7 +155,7 @@ class WhatsAppSession {
                     },
                     body: JSON.stringify(payload)
                 });
-                
+
                 if (!response.ok) {
                     console.log(`⚠️ [${this.sessionId}] Webhook to ${webhook.url} failed: ${response.status}`);
                 }
@@ -166,7 +163,7 @@ class WhatsAppSession {
                 console.log(`⚠️ [${this.sessionId}] Webhook to ${webhook.url} error:`, error.message);
             }
         });
-        
+
         // Wait for all webhooks to complete (non-blocking)
         Promise.all(promises).catch(() => {});
     }
@@ -175,7 +172,6 @@ class WhatsAppSession {
 
     async connect() {
         try {
-            // Fresh pairing window: clear any state from a previous expired QR.
             this._clearQrTimer();
             this.qrExpired = false;
 
@@ -197,8 +193,7 @@ class WhatsAppSession {
                 }
             }
 
-            // Save store periodically (every 30 seconds) and cleanup old media.
-            // Reconnects re-enter here, so drop the previous timer first.
+            // Save store periodically (every 30 seconds) and cleanup old media
             if (this.storeInterval) clearInterval(this.storeInterval);
             this.storeInterval = setInterval(() => {
                 try {
@@ -210,12 +205,11 @@ class WhatsAppSession {
                 }
             }, 30_000);
 
-            // Socket + media traffic both go through the session's proxy, if set.
             let proxyAgents = null;
             if (this.proxy) {
                 try {
                     proxyAgents = buildProxyAgents(this.proxy);
-                    console.log(`🛡️ [${this.sessionId}] Connecting through proxy ${redactProxyUrl(this.proxy)}`);
+                    console.log(`[${this.sessionId}] Connecting through proxy ${redactProxyUrl(this.proxy)}`);
                 } catch (error) {
                     this.connectionStatus = 'error';
                     console.error(`[${this.sessionId}] Invalid proxy, not connecting:`, error.message);
@@ -250,17 +244,13 @@ class WhatsAppSession {
     }
 
     /**
-     * Drop the live socket and let the close handler reconnect with the
-     * current config (e.g. a new proxy). Credentials are kept — no new QR is
-     * needed for a paired session.
+     * Drop the live socket so the close handler reconnects with the current
+     * config (e.g. a new proxy). Credentials are kept - no new QR needed.
      */
     async restart(reason = 'Restart requested') {
-        if (!this.socket) {
-            return this.connect();
-        }
+        if (!this.socket) return this.connect();
         try {
-            console.log(`🔁 [${this.sessionId}] Restarting connection: ${reason}`);
-            // No loggedOut status code on this error -> handler schedules connect() in 5s.
+            console.log(`[${this.sessionId}] Restarting connection: ${reason}`);
             this.socket.end(new Error(reason));
             return { success: true, message: 'Reconnecting with the current configuration' };
         } catch (error) {
@@ -268,22 +258,19 @@ class WhatsAppSession {
         }
     }
 
-    /** One pairing window per connect(): if no scan happens in time, end the socket. */
     _startQrExpiryTimer() {
         if (this.qrTimer) return;
         this.qrExpiresAt = Date.now() + QR_EXPIRY_MS;
         this.qrTimer = setTimeout(() => {
             this.qrTimer = null;
-            // Only relevant while still waiting for a scan.
             if (this.connectionStatus !== 'qr_ready' && this.connectionStatus !== 'connecting') return;
-            console.log(`⏰ [${this.sessionId}] QR expiry timer fired (${QR_EXPIRY_MS / 1000}s) — revoking session.`);
+            console.log(`[${this.sessionId}] QR expiry timer fired - revoking session.`);
             this.qrExpired = true;
             try {
                 this.socket?.end(new Error('QR code expired'));
             } catch (e) {
                 this._markQrExpired('QR code expired');
             }
-            // Socket already gone: end() is a no-op and no close event will follow.
             if (!this.socket) this._markQrExpired('QR code expired');
         }, QR_EXPIRY_MS);
     }
@@ -296,20 +283,18 @@ class WhatsAppSession {
         this.qrExpiresAt = null;
     }
 
-    /** Terminal state for a pairing window that ended without a scan. */
     _markQrExpired(reason) {
         if (this.connectionStatus === 'qr_expired') return;
         this._clearQrTimer();
         this.qrExpired = false;
         this.connectionStatus = 'qr_expired';
         this.qrCode = null;
-        console.log(`⏰ [${this.sessionId}] QR login expired (${reason}) — session revoked. Reconnect to get a fresh QR.`);
+        console.log(`[${this.sessionId}] QR login expired (${reason}) - session revoked.`);
 
         wsManager.emitConnectionStatus(this.sessionId, 'qr_expired', { reason });
         wsManager.emitSessionStatus(this.sessionId, 'qr_expired', { reason });
         this._sendWebhook('connection.update', { status: 'qr_expired', reason });
 
-        // Partial pairing creds are useless without a scan — drop them.
         if (this.storeInterval) {
             clearInterval(this.storeInterval);
             this.storeInterval = null;
@@ -317,7 +302,8 @@ class WhatsAppSession {
         this.deleteAuthFolder();
     }
 
-    _setupEventListeners(saveCreds) {        // Connection update
+    _setupEventListeners(saveCreds) {
+        // Connection update
         this.socket.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
 
@@ -330,29 +316,25 @@ class WhatsAppSession {
                 wsManager.emitQRCode(this.sessionId, this.qrCode);
                 wsManager.emitSessionStatus(this.sessionId, 'qr_ready', { qrExpiresAt: this.qrExpiresAt });
 
-                // Start (or keep) the pairing countdown — no endless QR minting.
                 this._startQrExpiryTimer();
             }
 
             if (connection === 'close') {
                 const reason = lastDisconnect?.error?.message;
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
-                const wasConnected = this.connectionStatus === 'connected';
-                // QR pairing window over: either our timer fired, or Baileys ran
-                // out of QR refs ("QR refs attempts ended", statusCode timedOut)
-                // for a session that never finished pairing.
                 const qrExpired =
                     this.qrExpired ||
                     reason === 'QR refs attempts ended' ||
                     (statusCode === DisconnectReason.timedOut && !this.phoneNumber);
 
-                console.log(`❌ [${this.sessionId}] Connection closed:`, reason);
+                console.log(`[${this.sessionId}] Connection closed:`, reason);
 
                 if (qrExpired) {
                     this._markQrExpired(reason || 'QR expired');
                     return;
                 }
 
+                const wasConnected = this.connectionStatus === 'connected';
                 const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
                 this.connectionStatus = shouldReconnect ? 'disconnected' : 'logged_out';
                 this.qrCode = null;
@@ -370,8 +352,7 @@ class WhatsAppSession {
                     shouldReconnect
                 });
 
-                // Explicit lifecycle event: only when an account that WAS online
-                // went away, so consumers can react to "this person disconnected".
+                // Explicit lifecycle event: only when an account that WAS online went away.
                 if (wasConnected) {
                     sessionEvents.onSessionDisconnected({
                         sessionId: this.sessionId,
@@ -389,25 +370,25 @@ class WhatsAppSession {
                 });
 
                 if (shouldReconnect) {
-                    console.log(`🔄 [${this.sessionId}] Reconnecting...`);
+                    console.log(`[${this.sessionId}] Reconnecting...`);
                     setTimeout(() => this.connect(), 5000);
                 } else {
-                    console.log(`🚪 [${this.sessionId}] Logged out.`);
+                    console.log(`[${this.sessionId}] Logged out.`);
                     wsManager.emitLoggedOut(this.sessionId);
                     this.deleteAuthFolder();
                 }
             } else if (connection === 'open') {
                 this._clearQrTimer();
                 this.qrExpired = false;
-                console.log(`✅ [${this.sessionId}] WhatsApp Connected Successfully!`);
+                console.log(`[${this.sessionId}] WhatsApp Connected Successfully!`);
                 this.connectionStatus = 'connected';
                 this.qrCode = null;
-                
+
                 if (this.socket.user) {
                     this.phoneNumber = this.socket.user.id.split(':')[0];
                     this.name = this.socket.user.name || 'Unknown';
                     console.log(`👤 [${this.sessionId}] Connected as: ${this.name} (${this.phoneNumber})`);
-                    
+
                     // Register me JID, LID, and Phone Number
                     if (this.store) {
                         const normalizedMe = jidNormalizedUser(this.socket.user.id);
@@ -417,13 +398,13 @@ class WhatsAppSession {
                         }
                     }
                 }
-                
+
                 // Emit connection status to WebSocket
                 wsManager.emitConnectionStatus(this.sessionId, 'connected', {
                     phoneNumber: this.phoneNumber,
                     name: this.name
                 });
-                
+
                 // Send webhook
                 this._sendWebhook('connection.update', {
                     status: 'connected',
@@ -432,9 +413,18 @@ class WhatsAppSession {
                 });
 
                 // Explicit lifecycle event
-                const details = { sessionId: this.sessionId, phoneNumber: this.phoneNumber, name: this.name };
-                sessionEvents.onSessionConnected(details, { sendWebhook: (event, data) => this._sendWebhook(event, data) });
-                wsManager.emitSessionStatus(this.sessionId, 'connected', details);
+                sessionEvents.onSessionConnected(
+                    { sessionId: this.sessionId, phoneNumber: this.phoneNumber, name: this.name },
+                    { sendWebhook: (event, data) => this._sendWebhook(event, data) }
+                );
+                wsManager.emitSessionStatus(this.sessionId, 'connected', { phoneNumber: this.phoneNumber, name: this.name });
+
+                // Chats can arrive keyed by @lid with no name - resolve to phone numbers
+                // in the background so the chat list is readable.
+                clearTimeout(this._lidResolveTimer1);
+                clearTimeout(this._lidResolveTimer2);
+                this._lidResolveTimer1 = setTimeout(() => this._resolvePendingLids().catch(() => {}), 6000);
+                this._lidResolveTimer2 = setTimeout(() => this._resolvePendingLids().catch(() => {}), 20000);
             } else if (connection === 'connecting') {
                 console.log(`🔄 [${this.sessionId}] Connecting to WhatsApp...`);
                 this.connectionStatus = 'connecting';
@@ -455,15 +445,15 @@ class WhatsAppSession {
                 if (!m?.messages || !Array.isArray(m.messages) || m.messages.length === 0) {
                     return;
                 }
-                
+
                 const message = m.messages[0];
-                
+
                 // Validate message structure
                 if (!message || !message.key || !message.key.remoteJid) {
                     console.log(`⚠️ [${this.sessionId}] Received invalid message structure, skipping`);
                     return;
                 }
-                
+
                 // Media we sent from a local file: point the stored echo at that file.
                 this._applyPendingMediaPath(message);
 
@@ -472,18 +462,18 @@ class WhatsAppSession {
 
                     // Auto-save media if present
                     await this._autoSaveMedia(message);
-                    
+
                     // Emit message to WebSocket
                     const formattedMessage = MessageFormatter.formatMessage(message, this.store);
                     wsManager.emitMessage(this.sessionId, formattedMessage);
-                    
+
                     // Send webhook
                     this._sendWebhook('message', formattedMessage);
                 } else if (message.key.fromMe && m.type === 'notify') {
                     // Message sent confirmation
                     const formattedMessage = MessageFormatter.formatMessage(message, this.store);
                     wsManager.emitMessageSent(this.sessionId, formattedMessage);
-                    
+
                     // Send webhook
                     this._sendWebhook('message.sent', formattedMessage);
                 }
@@ -636,7 +626,8 @@ class WhatsAppSession {
             storeStats: this.store ? this.store.getStats() : null,
             metadata: this.metadata,
             webhooks: this.webhooks,
-            proxy: redactProxyUrl(this.proxy)
+            proxy: redactProxyUrl(this.proxy),
+            sync: this.store ? this.store.syncState : null
         };
     }
 
@@ -646,15 +637,15 @@ class WhatsAppSession {
             if (this.storeInterval) {
                 clearInterval(this.storeInterval);
             }
-            
+
             // Clear store and delete all media files
             if (this.store) {
                 this.store.clear();
             }
-            
+
             // Delete media folder for this session
             this.deleteMediaFolder();
-            
+
             if (this.socket) {
                 await this.socket.logout();
                 this.socket = null;
@@ -723,12 +714,12 @@ class WhatsAppSession {
 
     formatJid(id, isGroup = false) {
         if (id.includes('@')) return id;
-        
+
         let formatted = id.replace(/\D/g, '');
         if (formatted.startsWith('0')) {
             formatted = '62' + formatted.slice(1);
         }
-        
+
         return isGroup ? `${formatted}@g.us` : `${formatted}@c.us`;
     }
 
@@ -783,16 +774,16 @@ class WhatsAppSession {
 
     async resolveLidFromServer(lid) {
         if (!lid || !lid.endsWith('@lid') || !this.socket) return null;
-        
+
         try {
             const { USyncQuery, USyncUser } = require('@whiskeysockets/baileys');
             const query = new USyncQuery()
                 .withContext('message')
                 .withDeviceProtocol()
                 .withLIDProtocol();
-                
+
             query.withUser(new USyncUser().withId(lid));
-            
+
             const result = await this.socket.executeUSyncQuery(query);
             if (result && result.list) {
                 for (const item of result.list) {
@@ -818,6 +809,39 @@ class WhatsAppSession {
         return null;
     }
 
+    /**
+     * Resolve chats/messages keyed by @lid (WhatsApp privacy IDs) to real phone
+     * JIDs so the chat list shows numbers/names instead of raw LIDs. Runs in the
+     * background after connect.
+     */
+    async _resolvePendingLids(max = 80) {
+        if (!this.store || !this.socket || this.connectionStatus !== 'connected') return;
+        const pending = new Set();
+        const collect = (id) => {
+            if (id && id.endsWith('@lid') && !this.store.resolveIdentity(id)) pending.add(id);
+        };
+        for (const id of this.store.messages.keys()) collect(id);
+        for (const id of this.store.chats.keys()) collect(id);
+        for (const id of this.store.contacts.keys()) collect(id);
+        const lids = [...pending].slice(0, max);
+        if (lids.length === 0) return;
+        console.log(`[${this.sessionId}] resolving ${lids.length} LID mapping(s)...`);
+        let resolved = 0;
+        for (const lid of lids) {
+            if (this.connectionStatus !== 'connected') break;
+            try {
+                const r = await this.resolveLidFromServer(lid);
+                if (r) resolved++;
+            } catch (e) { /* skip bad LID */ }
+            await new Promise((r) => setTimeout(r, 120));
+        }
+        if (resolved > 0) {
+            this.store._invalidateOverviewCache?.();
+            this.store._invalidateContactsCache?.();
+            console.log(`[${this.sessionId}] resolved ${resolved}/${lids.length} LID mapping(s)`);
+        }
+    }
+
     // ==================== SEND MESSAGES ====================
 
     /**
@@ -833,7 +857,7 @@ class WhatsAppSession {
 
             const jid = this.formatChatId(chatId);
             await this.socket.sendPresenceUpdate(presence, jid);
-            
+
             return { success: true, message: `Presence '${presence}' sent` };
         } catch (error) {
             return { success: false, message: error.message };
@@ -860,13 +884,13 @@ class WhatsAppSession {
             }
 
             const jid = this.formatChatId(chatId);
-            
+
             // Simulate typing if typingTime > 0
             await this._simulateTyping(jid, typingTime);
-            
+
             const messageContent = { text: message };
             const messageOptions = {};
-            
+
             // Add quoted message for reply
             if (replyTo) {
                 // Try to get the message from store first
@@ -885,11 +909,11 @@ class WhatsAppSession {
                     };
                 }
             }
-            
+
             const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
-            
-            return { 
-                success: true, 
+
+            return {
+                success: true,
                 message: 'Message sent successfully',
                 data: {
                     messageId: result.key.id,
@@ -909,16 +933,16 @@ class WhatsAppSession {
             }
 
             const jid = this.formatChatId(chatId);
-            
+
             // Simulate typing if typingTime > 0
             await this._simulateTyping(jid, typingTime);
-            
+
             const messageContent = {
                 image: { url: this._resolveMediaUrl(imageUrl) },
                 caption: caption
             };
             const messageOptions = {};
-            
+
             // Add quoted message for reply
             if (replyTo) {
                 const quotedMsg = this.store?.getMessage(jid, replyTo);
@@ -935,7 +959,7 @@ class WhatsAppSession {
                     };
                 }
             }
-            
+
             const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
             this._rememberOutgoingMedia(jid, result.key.id, imageUrl);
 
@@ -960,10 +984,10 @@ class WhatsAppSession {
             }
 
             const jid = this.formatChatId(chatId);
-            
+
             // Simulate typing if typingTime > 0
             await this._simulateTyping(jid, typingTime);
-            
+
             const messageContent = {
                 document: { url: this._resolveMediaUrl(documentUrl) },
                 fileName: filename,
@@ -971,7 +995,7 @@ class WhatsAppSession {
                 caption: caption || undefined
             };
             const messageOptions = {};
-            
+
             // Add quoted message for reply
             if (replyTo) {
                 const quotedMsg = this.store?.getMessage(jid, replyTo);
@@ -988,7 +1012,7 @@ class WhatsAppSession {
                     };
                 }
             }
-            
+
             const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
             this._rememberOutgoingMedia(jid, result.key.id, documentUrl);
 
@@ -1019,169 +1043,103 @@ class WhatsAppSession {
             if (!this.socket || this.connectionStatus !== 'connected') {
                 return { success: false, message: 'Session not connected' };
             }
-
             const jid = this.formatChatId(chatId);
             await this._simulateTyping(jid, typingTime);
-
-            const messageContent = {
-                video: { url: this._resolveMediaUrl(videoUrl) },
-                caption,
-                gifPlayback: Boolean(gifPlayback)
-            };
+            const messageContent = { video: { url: this._resolveMediaUrl(videoUrl) }, caption, gifPlayback: Boolean(gifPlayback) };
             const messageOptions = {};
             if (replyTo) {
                 messageOptions.quoted = this.store?.getMessage(jid, replyTo) || {
-                    key: { remoteJid: jid, id: replyTo, fromMe: false },
-                    message: { conversation: '' }
+                    key: { remoteJid: jid, id: replyTo, fromMe: false }, message: { conversation: '' }
                 };
             }
-
             const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
             this._rememberOutgoingMedia(jid, result.key.id, videoUrl);
-
-            return {
-                success: true,
-                message: 'Video sent successfully',
-                data: {
-                    messageId: result.key.id,
-                    chatId: jid,
-                    timestamp: new Date().toISOString()
-                }
-            };
+            return { success: true, message: 'Video sent successfully', data: { messageId: result.key.id, chatId: jid, timestamp: new Date().toISOString() } };
         } catch (error) {
             return { success: false, message: error.message };
         }
     }
 
     /**
-     * Send a file that was uploaded to this server. The kind of WhatsApp
-     * message is picked from the mimetype: image / video / audio / document.
-     * @param {string} chatId
-     * @param {Object} file - { url: '/media/...', mimetype, filename, size }
-     * @param {Object} [opts] - { caption, typingTime, replyTo, ptt, asDocument }
+     * Send a file uploaded to this server. The WhatsApp message kind is picked
+     * from the mimetype: image / video / audio / document.
      */
     async sendMedia(chatId, file, opts = {}) {
         try {
             if (!this.socket || this.connectionStatus !== 'connected') {
                 return { success: false, message: 'Session not connected' };
             }
-            if (!file || !file.url) {
-                return { success: false, message: 'No file to send' };
-            }
-
+            if (!file || !file.url) return { success: false, message: 'No file to send' };
             const { caption = '', typingTime = 0, replyTo = null, ptt = false, asDocument = false } = opts;
             const mimetype = (file.mimetype || 'application/octet-stream').toLowerCase();
             const source = this._resolveMediaUrl(file.url);
             const jid = this.formatChatId(chatId);
             await this._simulateTyping(jid, typingTime);
 
-            let kind;
-            let messageContent;
+            let kind, messageContent;
             if (!asDocument && mimetype.startsWith('image/') && mimetype !== 'image/webp') {
-                kind = 'image';
-                messageContent = { image: { url: source }, caption };
+                kind = 'image'; messageContent = { image: { url: source }, caption };
             } else if (!asDocument && mimetype.startsWith('video/')) {
-                kind = 'video';
-                messageContent = { video: { url: source }, caption };
+                kind = 'video'; messageContent = { video: { url: source }, caption };
             } else if (!asDocument && mimetype.startsWith('audio/')) {
-                kind = ptt ? 'ptt' : 'audio';
-                messageContent = { audio: { url: source }, mimetype, ptt: Boolean(ptt) };
+                kind = ptt ? 'ptt' : 'audio'; messageContent = { audio: { url: source }, mimetype, ptt: Boolean(ptt) };
             } else {
                 kind = 'document';
-                messageContent = {
-                    document: { url: source },
-                    mimetype,
-                    fileName: file.filename || path.basename(source),
-                    caption
-                };
+                messageContent = { document: { url: source }, mimetype, fileName: file.filename || path.basename(source), caption };
             }
-
             const messageOptions = {};
             if (replyTo) {
                 messageOptions.quoted = this.store?.getMessage(jid, replyTo) || {
-                    key: { remoteJid: jid, id: replyTo, fromMe: false },
-                    message: { conversation: '' }
+                    key: { remoteJid: jid, id: replyTo, fromMe: false }, message: { conversation: '' }
                 };
             }
-
             const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
             this._rememberOutgoingMedia(jid, result.key.id, file.url);
-
             return {
-                success: true,
-                message: `${kind} sent successfully`,
-                data: {
-                    messageId: result.key.id,
-                    chatId: jid,
-                    type: kind,
-                    mediaUrl: file.url,
-                    mimetype,
-                    filename: file.filename || null,
-                    caption: caption || null,
-                    timestamp: new Date().toISOString()
-                }
+                success: true, message: `${kind} sent successfully`,
+                data: { messageId: result.key.id, chatId: jid, type: kind, mediaUrl: file.url, mimetype, filename: file.filename || null, caption: caption || null, timestamp: new Date().toISOString() }
             };
         } catch (error) {
             return { success: false, message: error.message };
         }
     }
 
-    /**
-     * Make sure a message's media is on disk and return its URL — downloads
-     * it from WhatsApp on first request (history messages, big videos).
-     */
+    /** Ensure a message's media is on disk and return its URL (downloads on first request). */
     async getMessageMedia(chatId, messageId) {
         try {
-            if (!this.store) {
-                return { success: false, message: 'Session store not ready' };
-            }
+            if (!this.store) return { success: false, message: 'Session store not ready' };
             const jid = this.formatChatId(chatId);
-            const msg = this.store.getMessage(jid, messageId)
-                || this.store.getMessage(chatId, messageId);
-            if (!msg) {
-                return { success: false, message: 'Message not found in this session\'s history' };
-            }
+            const msg = this.store.getMessage(jid, messageId) || this.store.getMessage(chatId, messageId);
+            if (!msg) return { success: false, message: "Message not found in this session's history" };
 
             const contentType = msg.message ? getContentType(msg.message) : null;
             const mediaContent = contentType ? msg.message[contentType] : null;
             if (!mediaContent || !['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(contentType)) {
                 return { success: false, message: 'Message has no media' };
             }
-
             let relativePath = msg._mediaPath || null;
             const onDisk = relativePath && fs.existsSync(msg._mediaLocalPath || path.join(process.cwd(), 'public', relativePath));
             if (!onDisk) {
                 if (!this.socket || this.connectionStatus !== 'connected') {
-                    return { success: false, message: 'Session not connected — cannot download media' };
+                    return { success: false, message: 'Session not connected - cannot download media' };
                 }
                 relativePath = await this._autoSaveMedia(msg, { force: true });
-                if (!relativePath) {
-                    return { success: false, message: 'Media could not be downloaded (it may have expired on WhatsApp)' };
-                }
+                if (!relativePath) return { success: false, message: 'Media could not be downloaded (it may have expired on WhatsApp)' };
             }
-
             return {
                 success: true,
-                data: {
-                    messageId,
-                    chatId: jid,
-                    url: relativePath,
-                    mimetype: mediaContent.mimetype || this._getMimetype(contentType),
-                    filename: mediaContent.fileName || path.basename(relativePath),
-                    size: Number(mediaContent.fileLength) || null
-                }
+                data: { messageId, chatId: jid, url: relativePath, mimetype: mediaContent.mimetype || this._getMimetype(contentType), filename: mediaContent.fileName || path.basename(relativePath), size: Number(mediaContent.fileLength) || null }
             };
         } catch (error) {
             return { success: false, message: error.message };
         }
     }
 
-    /** `/media/...` (our static mount) -> absolute file path Baileys can stream; anything else untouched. */
+    /** `/media/...` -> absolute file path Baileys can stream; anything else untouched. */
     _resolveMediaUrl(url) {
         if (typeof url === 'string' && url.startsWith('/media/')) {
             const clean = decodeURIComponent(url.split('?')[0]);
             const abs = path.join(process.cwd(), 'public', clean);
-            // Never let a crafted URL escape public/media.
             const root = path.join(process.cwd(), 'public', 'media');
             if (!abs.startsWith(root)) throw new Error('Invalid media path');
             return abs;
@@ -1189,7 +1147,6 @@ class WhatsAppSession {
         return url;
     }
 
-    /** Remember that an outgoing message's media lives at a local /media/ URL. */
     _rememberOutgoingMedia(jid, messageId, url) {
         if (!messageId || typeof url !== 'string' || !url.startsWith('/media/')) return;
         const clean = url.split('?')[0];
@@ -1227,28 +1184,28 @@ class WhatsAppSession {
             // Validate OGG format
             const urlLower = audioUrl.toLowerCase();
             if (!urlLower.endsWith('.ogg') && !urlLower.includes('.ogg?')) {
-                return { 
-                    success: false, 
-                    message: 'Audio must be in OGG format (.ogg). WhatsApp only supports OGG audio files.' 
+                return {
+                    success: false,
+                    message: 'Audio must be in OGG format (.ogg). WhatsApp only supports OGG audio files.'
                 };
             }
 
             const jid = this.formatChatId(chatId);
-            
+
             // Simulate recording if typingTime > 0
             if (typingTime > 0) {
                 await this.socket.sendPresenceUpdate('recording', jid);
                 await new Promise(resolve => setTimeout(resolve, typingTime));
                 await this.socket.sendPresenceUpdate('paused', jid);
             }
-            
+
             const messageContent = {
                 audio: { url: this._resolveMediaUrl(audioUrl) },
                 ptt: ptt, // true = voice note, false = audio file
                 mimetype: 'audio/ogg; codecs=opus'
             };
             const messageOptions = {};
-            
+
             // Add quoted message for reply
             if (replyTo) {
                 const quotedMsg = this.store?.getMessage(jid, replyTo);
@@ -1265,7 +1222,7 @@ class WhatsAppSession {
                     };
                 }
             }
-            
+
             const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
 
             return {
@@ -1289,10 +1246,10 @@ class WhatsAppSession {
             }
 
             const jid = this.formatChatId(chatId);
-            
+
             // Simulate typing if typingTime > 0
             await this._simulateTyping(jid, typingTime);
-            
+
             const messageContent = {
                 location: {
                     degreesLatitude: latitude,
@@ -1301,7 +1258,7 @@ class WhatsAppSession {
                 }
             };
             const messageOptions = {};
-            
+
             // Add quoted message for reply
             if (replyTo) {
                 const quotedMsg = this.store?.getMessage(jid, replyTo);
@@ -1318,7 +1275,7 @@ class WhatsAppSession {
                     };
                 }
             }
-            
+
             const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
 
             return {
@@ -1342,12 +1299,12 @@ class WhatsAppSession {
             }
 
             const jid = this.formatChatId(chatId);
-            
+
             // Simulate typing if typingTime > 0
             await this._simulateTyping(jid, typingTime);
-            
+
             const vcard = `BEGIN:VCARD\nVERSION:3.0\nFN:${contactName}\nTEL;type=CELL;type=VOICE;waid=${contactPhone}:+${contactPhone}\nEND:VCARD`;
-            
+
             const messageContent = {
                 contacts: {
                     displayName: contactName,
@@ -1355,7 +1312,7 @@ class WhatsAppSession {
                 }
             };
             const messageOptions = {};
-            
+
             // Add quoted message for reply
             if (replyTo) {
                 const quotedMsg = this.store?.getMessage(jid, replyTo);
@@ -1372,7 +1329,7 @@ class WhatsAppSession {
                     };
                 }
             }
-            
+
             const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
 
             return {
@@ -1402,14 +1359,14 @@ class WhatsAppSession {
             }
 
             const jid = this.formatChatId(chatId);
-            
+
             // Simulate typing if typingTime > 0
             await this._simulateTyping(jid, typingTime);
-            
+
             // WhatsApp deprecated regular buttons in 2022
             // Using Poll as an alternative for interactive choices
             const pollName = footer ? `${text}\n\n${footer}` : text;
-            
+
             const messageContent = {
                 poll: {
                     name: pollName,
@@ -1418,7 +1375,7 @@ class WhatsAppSession {
                 }
             };
             const messageOptions = {};
-            
+
             // Add quoted message for reply
             if (replyTo) {
                 const quotedMsg = this.store?.getMessage(jid, replyTo);
@@ -1435,7 +1392,7 @@ class WhatsAppSession {
                     };
                 }
             }
-            
+
             const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
 
             return {
@@ -1464,10 +1421,10 @@ class WhatsAppSession {
             }
 
             const jid = this.formatChatId(chatId);
-            
+
             // Simulate typing if typingTime > 0
             await this._simulateTyping(jid, typingTime);
-            
+
             const messageContent = {
                 poll: {
                     name: question,
@@ -1476,7 +1433,7 @@ class WhatsAppSession {
                 }
             };
             const messageOptions = {};
-            
+
             // Add quoted message for reply
             if (replyTo) {
                 const quotedMsg = this.store?.getMessage(jid, replyTo);
@@ -1493,7 +1450,7 @@ class WhatsAppSession {
                     };
                 }
             }
-            
+
             const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
 
             return {
@@ -1520,7 +1477,7 @@ class WhatsAppSession {
 
             const jid = this.formatPhoneNumber(phone);
             const [result] = await this.socket.onWhatsApp(jid.replace('@c.us', ''));
-            
+
             return {
                 success: true,
                 data: {
@@ -1542,7 +1499,7 @@ class WhatsAppSession {
 
             const jid = this.formatPhoneNumber(phone);
             const ppUrl = await this.socket.profilePictureUrl(jid, 'image');
-            
+
             return {
                 success: true,
                 data: {
@@ -1551,12 +1508,12 @@ class WhatsAppSession {
                 }
             };
         } catch (error) {
-            return { 
-                success: true, 
-                data: { 
-                    phone: phone, 
-                    profilePicture: null 
-                } 
+            return {
+                success: true,
+                data: {
+                    phone: phone,
+                    profilePicture: null
+                }
             };
         }
     }
@@ -1568,7 +1525,7 @@ class WhatsAppSession {
             }
 
             const jid = this.formatPhoneNumber(phone);
-            
+
             let profilePicture = null;
             try {
                 profilePicture = await this.socket.profilePictureUrl(jid, 'image');
@@ -1603,15 +1560,9 @@ class WhatsAppSession {
 
     // ==================== SCRAPERS & ADDRESS BOOK ====================
 
-    /**
-     * Every contact this account knows, for the contact scraper (no pagination).
-     * @param {Object} [opts] - { includeProfilePicture?: boolean }
-     */
     async scrapeContacts(opts = {}) {
         try {
-            if (!this.store) {
-                return { success: false, message: 'Store not initialized' };
-            }
+            if (!this.store) return { success: false, message: 'Store not initialized' };
             const { data } = this.store.getContactsFast({ limit: Number.MAX_SAFE_INTEGER, offset: 0, search: '' });
             const contacts = data.map((c) => ({
                 jid: c.id,
@@ -1630,16 +1581,11 @@ class WhatsAppSession {
         }
     }
 
-    /**
-     * Scrape the members of one or more groups on this account.
-     * @param {string[]|null} groupIds - specific groups, or null/[] for all groups the account is in
-     */
     async scrapeGroupContacts(groupIds = null) {
         try {
             if (!this.socket || this.connectionStatus !== 'connected') {
                 return { success: false, message: 'Session not connected' };
             }
-
             let targets;
             if (Array.isArray(groupIds) && groupIds.length > 0) {
                 targets = groupIds.map((g) => this.formatJid(g, true));
@@ -1647,7 +1593,6 @@ class WhatsAppSession {
                 const all = await this.socket.groupFetchAllParticipating();
                 targets = Object.keys(all);
             }
-
             const groups = [];
             const contacts = [];
             const errors = [];
@@ -1679,17 +1624,12 @@ class WhatsAppSession {
                     });
                 }
             }
-
             return { success: true, data: { groups, contacts, errors: errors.length ? errors : undefined } };
         } catch (error) {
             return { success: false, message: error.message };
         }
     }
 
-    /**
-     * Save a number to this account's address book (WhatsApp app-state sync),
-     * so it shows up as a saved contact before being added to a group.
-     */
     async saveContact(phone, name = '') {
         try {
             if (!this.socket || this.connectionStatus !== 'connected') {
@@ -1697,56 +1637,38 @@ class WhatsAppSession {
             }
             const jid = this.formatJid(phone, false);
             const displayName = (name && name.trim()) || jid.split('@')[0];
-
             if (typeof this.socket.addOrEditContact !== 'function') {
                 return { success: false, message: 'This Baileys build cannot save contacts' };
             }
-
             await this.socket.addOrEditContact(jid, {
                 fullName: displayName,
                 firstName: displayName,
                 saveOnPrimaryAddressbook: true,
                 pnJid: jid
             });
-
             if (this.store) {
                 const existing = this.store.contacts.get(jid) || { id: jid };
                 this.store.contacts.set(jid, { ...existing, id: jid, name: displayName });
             }
-
-            return {
-                success: true,
-                message: 'Contact saved',
-                data: { jid, phone: jid.split('@')[0], name: displayName }
-            };
+            return { success: true, message: 'Contact saved', data: { jid, phone: jid.split('@')[0], name: displayName } };
         } catch (error) {
             return { success: false, message: error.message };
         }
     }
 
-    /**
-     * Save a number as a contact, then add it to a group. Point (3): the number
-     * is saved on the account first, then the group add is attempted.
-     */
     async addContactToGroup(groupId, phone, name = '') {
         try {
             if (!this.socket || this.connectionStatus !== 'connected') {
                 return { success: false, message: 'Session not connected' };
             }
-            if (!groupId || !phone) {
-                return { success: false, message: 'groupId and phone are required' };
-            }
-
+            if (!groupId || !phone) return { success: false, message: 'groupId and phone are required' };
             const saved = await this.saveContact(phone, name);
-
             const gid = this.formatJid(groupId, true);
             const jid = this.formatJid(phone, false);
             const result = await this.socket.groupParticipantsUpdate(gid, [jid], 'add');
-
             const entry = Array.isArray(result) ? result[0] : null;
             const code = entry && entry.status ? String(entry.status) : '200';
             const ok = code === '200';
-
             return {
                 success: ok,
                 message: ok ? 'Contact saved and added to group' : `Saved, but group add returned status ${code}`,
@@ -2063,7 +1985,7 @@ class WhatsAppSession {
                     profilePicture: chat.profilePicture,
                     participantsCount: null,
                     lastMessage: chat.lastMessage?.preview || null,
-                    lastMessageTimestamp: chat.lastMessage?.timestamp || chat.conversationTimestamp || 0,
+                    lastMessageTimestamp: BaileysStore.toUnixSeconds(chat.lastMessage?.timestamp || chat.conversationTimestamp),
                     unreadCount: chat.unreadCount || 0
                 };
             });
@@ -2161,25 +2083,25 @@ class WhatsAppSession {
             }
 
             const jid = this.formatChatId(chatId);
-            
+
             // Resolve unmapped LID from server
             if (jid && jid.endsWith('@lid') && this.store && !this.store.resolveIdentity(jid)) {
                 await this.resolveLidFromServer(jid);
             }
 
             const isGroup = this.isGroupId(jid);
-            
+
             let messages = [];
-            
+
             // Try to fetch from server first (if fetchMessageHistory is available)
             if (typeof this.socket.fetchMessageHistory === 'function') {
                 try {
-                    const cursorMsg = cursor ? { 
-                        before: { 
-                            id: cursor, 
+                    const cursorMsg = cursor ? {
+                        before: {
+                            id: cursor,
                             fromMe: false,
-                            remoteJid: jid 
-                        } 
+                            remoteJid: jid
+                        }
                     } : undefined;
 
                     const result = await this.socket.fetchMessageHistory(limit, cursorMsg, jid);
@@ -2215,8 +2137,8 @@ class WhatsAppSession {
                     isGroup: isGroup,
                     total: formattedMessages.length,
                     limit: limit,
-                    cursor: formattedMessages.length > 0 
-                        ? formattedMessages[formattedMessages.length - 1].id 
+                    cursor: formattedMessages.length > 0
+                        ? formattedMessages[formattedMessages.length - 1].id
                         : null,
                     hasMore: formattedMessages.length === limit,
                     messages: formattedMessages
@@ -2234,14 +2156,14 @@ class WhatsAppSession {
             }
 
             const jid = this.formatChatId(chatId);
-            
+
             // Resolve unmapped LID from server
             if (jid && jid.endsWith('@lid') && this.store && !this.store.resolveIdentity(jid)) {
                 await this.resolveLidFromServer(jid);
             }
 
             const isGroup = this.isGroupId(jid);
-            
+
             let profilePicture = null;
             try {
                 profilePicture = await this.socket.profilePictureUrl(jid, 'image');
@@ -2294,7 +2216,7 @@ class WhatsAppSession {
                         phone = resolved.pn || phone;
                     }
                 }
-                
+
                 let status = null;
                 try {
                     const statusResult = await this.socket.fetchStatus(jid);
@@ -2345,7 +2267,7 @@ class WhatsAppSession {
             // Get messages from store
             const storeMessages = this.store?.getMessages(jid, { limit: 50 }) || [];
             console.log(`[${this.sessionId}] Found ${storeMessages.length} messages in store for ${jid}`);
-            
+
             // Collect message keys to mark as read
             const keysToRead = [];
             for (const msg of storeMessages) {
@@ -2362,7 +2284,7 @@ class WhatsAppSession {
                     keysToRead.push(readKey);
                 }
             }
-            
+
             if (keysToRead.length > 0) {
                 console.log(`[${this.sessionId}] Marking ${keysToRead.length} messages as read`);
                 await this.socket.readMessages(keysToRead);
@@ -2401,15 +2323,11 @@ class WhatsAppSession {
             if (!contentType || !mediaTypes.includes(contentType)) return null;
 
             const mediaContent = message.message[contentType];
-            if (!mediaContent) return null;
-
-            // Big files (typically videos) are fetched on demand via getMessageMedia
-            // instead of on every incoming message.
-            const size = Number(mediaContent.fileLength) || 0;
-            if (!force && size > MEDIA_AUTOSAVE_MAX_BYTES) {
-                console.log(`⏭️ [${this.sessionId}] Skipping auto-save of ${contentType} (${Math.round(size / 1e6)} MB) — load on demand`);
+            const _size = Number(mediaContent?.fileLength) || 0;
+            if (!force && _size > MEDIA_AUTOSAVE_MAX_BYTES) {
                 return null;
             }
+            if (!mediaContent) return null;
 
             // Download media
             const buffer = await downloadMediaMessage(
@@ -2422,13 +2340,12 @@ class WhatsAppSession {
             // Create media folder structure: public/media/{sessionId}/{chatId}/
             const chatId = message.key.remoteJid.replace('@c.us', '').replace('@g.us', '');
             const mediaDir = path.join(this.mediaFolder, chatId);
-            
+
             if (!fs.existsSync(mediaDir)) {
                 fs.mkdirSync(mediaDir, { recursive: true });
             }
 
-            // Filename: message id + extension, so two "invoice.pdf"s never collide.
-            // The original name is still exposed by the formatter as `filename`.
+            // Generate filename
             const mimetype = mediaContent.mimetype || this._getMimetype(contentType);
             const ext = this._getExtFromMimetype(mimetype);
             const filename = `${message.key.id}.${ext}`;
@@ -2444,11 +2361,10 @@ class WhatsAppSession {
 
             // Store media path in message for later reference
             const relativePath = `/media/${this.sessionId}/${chatId}/${filename}`;
-            
+
             console.log(`💾 [${this.sessionId}] Media saved: ${relativePath}`);
 
-            // Update message in store with media path (and the object we were handed,
-            // which may be the store's own instance or a fresh copy)
+            // Update message in store with media path (and the object we were handed)
             message._mediaPath = relativePath;
             message._mediaLocalPath = filePath;
             if (this.store) {
@@ -2921,7 +2837,7 @@ class WhatsAppSession {
             }
 
             const groups = await this.socket.groupFetchAllParticipating();
-            
+
             const groupList = Object.values(groups).map(g => ({
                 id: g.id,
                 subject: g.subject,
@@ -2968,9 +2884,9 @@ class WhatsAppSession {
 
             const validSettings = ['announcement', 'not_announcement', 'locked', 'unlocked'];
             if (!validSettings.includes(setting)) {
-                return { 
-                    success: false, 
-                    message: `Invalid setting. Use: ${validSettings.join(', ')}` 
+                return {
+                    success: false,
+                    message: `Invalid setting. Use: ${validSettings.join(', ')}`
                 };
             }
 

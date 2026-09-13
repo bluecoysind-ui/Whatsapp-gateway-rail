@@ -1,0 +1,1 @@
+import{t as e}from"./index-Cobi_G84.js";import{t}from"./GatewayApp-CZzi7cjN.js";var n=e();function r(){return(0,n.jsx)(t,{})}export{r as component};

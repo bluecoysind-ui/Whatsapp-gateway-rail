@@ -2,9 +2,32 @@
  * Custom in-memory store for Baileys
  * Optimized version with pre-computed caches for fast queries
  */
+/**
+ * Normalize any WhatsApp timestamp to whole Unix SECONDS.
+ * Baileys delivers messageTimestamp as a number for live messages but as a
+ * protobuf Long ({ low, high }) for history messages — the Long is truthy, so
+ * unguarded it reaches the UI and becomes "Invalid Date".
+ */
+function toUnixSeconds(ts) {
+  if (ts == null) return 0;
+  let n;
+  if (typeof ts === 'number') n = ts;
+  else if (typeof ts === 'string') n = Number(ts);
+  else if (typeof ts === 'object') {
+    if (typeof ts.toNumber === 'function') n = ts.toNumber();
+    else if (typeof ts.low === 'number') n = (ts.high || 0) * 4294967296 + (ts.low >>> 0);
+    else n = Number(ts);
+  } else n = Number(ts);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  // Some sources give milliseconds — fold down to seconds.
+  return n > 1e12 ? Math.floor(n / 1000) : Math.floor(n);
+}
+
 class BaileysStore {
   constructor(sessionId = null) {
     this.sessionId = sessionId;
+    // History-sync progress, surfaced to the dashboard as a progress bar.
+    this.syncState = { active: false, progress: 0, isLatest: false, chats: 0, contacts: 0, messages: 0, startedAt: null, updatedAt: null };
     
     // Core data stores
     this.chats = new Map();
@@ -40,7 +63,97 @@ class BaileysStore {
   /**
    * Bind store to Baileys socket events
    */
+  // ---- history-sync ingestion (shared by messaging-history.set) ----
+
+  _ingestHistoryChat(chat) {
+    if (!chat || !chat.id) return;
+    let resolvedId = chat.id;
+    if (chat.id.endsWith('@lid')) {
+      const resolved = this.resolveIdentity(chat.id);
+      if (resolved && resolved.jid) resolvedId = resolved.jid;
+    }
+    chat.id = resolvedId;
+    this.chats.set(resolvedId, { ...this.chats.get(resolvedId), ...chat });
+    this._updateSingleChatOverview(resolvedId);
+  }
+
+  _ingestHistoryContact(contact) {
+    if (!contact || !contact.id) return;
+    if (contact.lid && !contact.id.endsWith('@lid')) {
+      this.registerIdentity(contact.lid, contact.id);
+    }
+    let resolvedId = contact.id;
+    if (contact.id.endsWith('@lid')) {
+      const resolved = this.resolveIdentity(contact.id);
+      if (resolved && resolved.jid) resolvedId = resolved.jid;
+    }
+    contact.id = resolvedId;
+    const existing = this.contacts.get(resolvedId) || {};
+    this.contacts.set(resolvedId, { ...existing, ...contact });
+  }
+
+  _ingestHistoryMessage(msg) {
+    if (!msg || !msg.key || !msg.key.remoteJid || !msg.key.id) return;
+    let resolvedId = msg.key.remoteJid;
+    if (resolvedId.endsWith('@lid')) {
+      const altJid = msg.key.remoteJidAlt || msg.remoteJidAlt;
+      if (altJid && altJid.endsWith('@s.whatsapp.net')) {
+        this.registerIdentity(resolvedId, altJid);
+        resolvedId = altJid;
+        msg.key.remoteJid = resolvedId;
+      } else {
+        const resolved = this.resolveIdentity(resolvedId);
+        if (resolved && resolved.jid) {
+          resolvedId = resolved.jid;
+          msg.key.remoteJid = resolvedId;
+        }
+      }
+    }
+    if (msg.key.participant && msg.key.participant.endsWith('@lid')) {
+      const resolved = this.resolveIdentity(msg.key.participant);
+      if (resolved && resolved.jid) msg.key.participant = resolved.jid;
+    }
+    if (msg.pushName && resolvedId && !resolvedId.endsWith('@lid') && !resolvedId.endsWith('@g.us')) {
+      const existing = this.contacts.get(resolvedId) || {};
+      if (!existing.notify || !existing.name) {
+        this.contacts.set(resolvedId, { ...existing, id: resolvedId, notify: msg.pushName });
+      }
+    }
+    if (!this.messages.has(resolvedId)) this.messages.set(resolvedId, new Map());
+    this.messages.get(resolvedId).set(msg.key.id, msg);
+    this._updateSingleChatOverview(resolvedId, msg);
+  }
+
   bind(ev) {
+    // Baileys v7 delivers the initial history sync (and syncFullHistory batches)
+    // as ONE event: 'messaging-history.set'. The older per-collection events
+    // ('chats.set' / 'contacts.set' / 'messages.set') below are never emitted by
+    // v7 — this handler is what actually populates chats, contacts and messages.
+    ev.on('messaging-history.set', ({ chats, contacts, messages, isLatest, progress }) => {
+      if (Array.isArray(contacts)) for (const c of contacts) this._ingestHistoryContact(c);
+      if (Array.isArray(chats)) for (const c of chats) this._ingestHistoryChat(c);
+      if (Array.isArray(messages)) for (const m of messages) this._ingestHistoryMessage(m);
+      this._invalidateContactsCache();
+      this._invalidateOverviewCache();
+
+      const st = this.syncState;
+      if (!st.startedAt) st.startedAt = Date.now();
+      st.chats += chats?.length || 0;
+      st.contacts += contacts?.length || 0;
+      st.messages += messages?.length || 0;
+      if (typeof progress === 'number') st.progress = Math.max(st.progress, Math.round(progress));
+      st.isLatest = Boolean(isLatest);
+      st.active = !st.isLatest && st.progress < 100;
+      st.updatedAt = Date.now();
+      if (!st.active) st.progress = 100;
+
+      console.log(
+        `\uD83D\uDCDA [${this.sessionId}] history sync: +${chats?.length || 0} chats, ` +
+        `+${contacts?.length || 0} contacts, +${messages?.length || 0} messages ` +
+        `(latest=${isLatest}, progress=${progress ?? '?'})`
+      );
+    });
+
     // Handle chat updates
     ev.on('chats.set', ({ chats }) => {
       for (const chat of chats) {
@@ -402,13 +515,7 @@ class BaileysStore {
         this.chatsOverview.delete(chatId);
         return;
       }
-      const getTimestamp = (msg) => {
-        if (!msg || msg.messageTimestamp == null) return 0;
-        const ts = msg.messageTimestamp;
-        // Handle Long object (protobuf) from Baileys
-        if (typeof ts === 'object' && ts !== null) return Number(ts) || 0;
-        return Number(ts) || 0;
-      };
+      const getTimestamp = (msg) => (msg ? toUnixSeconds(msg.messageTimestamp) : 0);
       messagesArray.sort((a, b) => getTimestamp(b) - getTimestamp(a));
       latestMessage = messagesArray[0];
     }
@@ -437,17 +544,17 @@ class BaileysStore {
 
     this.chatsOverview.set(chatId, {
       id: chatId,
-      name: groupMeta?.subject || contact?.name || contact?.notify || chat?.name || chatId.replace('@c.us', '').replace('@g.us', ''),
+      name: groupMeta?.subject || contact?.name || contact?.notify || chat?.name || chatId.split('@')[0],
       isGroup,
       unreadCount: chat?.unreadCount || 0,
       lastMessage: {
         id: latestMessage?.key?.id,
-        timestamp: latestMessage?.messageTimestamp,
+        timestamp: toUnixSeconds(latestMessage?.messageTimestamp),
         preview: this._extractMessagePreview(latestMessage),
         fromMe: latestMessage?.key?.fromMe || false
       },
       profilePicture: this.profilePictures.get(chatId) || null,
-      conversationTimestamp: chat?.conversationTimestamp || latestMessage?.messageTimestamp
+      conversationTimestamp: toUnixSeconds(chat?.conversationTimestamp) || toUnixSeconds(latestMessage?.messageTimestamp)
     });
 
     // Invalidate sorted cache since overview data changed
@@ -568,11 +675,13 @@ class BaileysStore {
   getContactsFast(options = {}) {
     const { limit = 100, offset = 0, search = '' } = options;
     
+    // Individual contacts: Baileys v7 keys them by @s.whatsapp.net; older data
+    // and normalized ids use @c.us. Groups (@g.us) and unresolved @lid are not contacts.
     let contacts = Array.from(this.contacts.values())
-      .filter(c => c.id.endsWith('@c.us'))
+      .filter(c => c.id && (c.id.endsWith('@c.us') || c.id.endsWith('@s.whatsapp.net')))
       .map(c => ({
         id: c.id,
-        name: c.name || c.notify || c.id.replace('@c.us', ''),
+        name: c.name || c.notify || c.id.split('@')[0],
         notify: c.notify,
         verifiedName: c.verifiedName,
         profilePicture: this.profilePictures.get(c.id) || null
@@ -1194,4 +1303,5 @@ class BaileysStore {
   }
 }
 
+BaileysStore.toUnixSeconds = toUnixSeconds;
 module.exports = BaileysStore;

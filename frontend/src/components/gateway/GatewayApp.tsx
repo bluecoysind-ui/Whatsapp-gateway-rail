@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ButtonHTMLAttributes, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import type { Bubble, BubbleMedia, ChatPreview } from "@/lib/gateway-types";
-import { type GatewaySession } from "@/lib/gateway-client";
+import { type GatewaySession, type SyncState } from "@/lib/gateway-client";
 import { cn } from "@/lib/cn";
 import { useGateway } from "@/store/gateway-store";
 import { Overlays, Toasts, ToolsPanel } from "./Overlays";
@@ -356,6 +356,34 @@ function emptyChatsMessage(total: number, query: string): string {
   return "No chats yet. Connect a session and scan the QR to load your conversations.";
 }
 
+/** Tiny inline spinner. */
+function Spinner({ className }: { className?: string }) {
+  return <span className={cn("inline-block size-3.5 animate-spin rounded-full border-2 border-white/25 border-t-indigo", className)} />;
+}
+
+/** Indeterminate sliding loading bar for paginated fetches. */
+function LoadBar() {
+  return <div className="wa-loadbar my-1 w-full" aria-label="Loading" />;
+}
+
+/** Thin progress bar shown while WhatsApp is still pushing this account's history. */
+function SyncBanner({ sync }: { sync: SyncState }) {
+  const pct = Math.min(100, Math.max(3, sync.progress || 0));
+  return (
+    <div className="mx-4 mb-2 rounded-xl border border-indigo/30 bg-indigo/10 px-3 py-2">
+      <div className="flex items-center justify-between text-[11px]">
+        <span className="font-medium text-indigo">Syncing history…</span>
+        <span className="text-muted">
+          {sync.chats} chats · {sync.messages} msgs{sync.progress ? ` · ${sync.progress}%` : ""}
+        </span>
+      </div>
+      <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-white/10">
+        <div className="h-full rounded-full bg-gradient-to-r from-indigo to-violet transition-[width] duration-500" style={{ width: `${pct}%` }} />
+      </div>
+    </div>
+  );
+}
+
 function ChatList() {
   const chats = useGateway((s) => s.chats);
   const chatsHasMore = useGateway((s) => s.chatsHasMore);
@@ -395,6 +423,12 @@ function ChatList() {
           </svg>
         </IconBtn>
       </div>
+      {account?.sync?.active ? <SyncBanner sync={account.sync} /> : null}
+      {chatsLoading && chats.length === 0 ? (
+        <div className="px-4 pb-1">
+          <LoadBar />
+        </div>
+      ) : null}
       <div className="flex items-center gap-1.5 px-4 pb-3">
         <FilterChip active={filter === "all"} onClick={() => setFilter("all")} count={chats.length}>
           All
@@ -447,9 +481,15 @@ function ChatList() {
             type="button"
             disabled={chatsLoading}
             onClick={() => void loadMoreChats()}
-            className="mt-1 w-full rounded-xl border border-line py-2 text-xs text-muted hover:text-ink disabled:opacity-50"
+            className="mt-1 flex w-full items-center justify-center gap-2 rounded-xl border border-line py-2 text-xs text-muted hover:text-ink disabled:opacity-70"
           >
-            {chatsLoading ? "Loading…" : "Load more chats"}
+            {chatsLoading ? (
+              <>
+                <Spinner /> Loading more…
+              </>
+            ) : (
+              "Load more chats"
+            )}
           </button>
         ) : null}
       </div>
@@ -588,16 +628,27 @@ function Conversation() {
             type="button"
             disabled={meta.loading}
             onClick={() => void loadOlder(id)}
-            className="self-center rounded-full border border-line bg-white/8 px-3.5 py-1 text-[11.5px] text-muted hover:text-ink disabled:opacity-50"
+            className="flex items-center gap-2 self-center rounded-full border border-line bg-white/8 px-3.5 py-1 text-[11.5px] text-muted hover:text-ink disabled:opacity-70"
           >
-            {meta.loading ? "Loading…" : "Load older messages"}
+            {meta.loading ? (
+              <>
+                <Spinner /> Loading older…
+              </>
+            ) : (
+              "Load older messages"
+            )}
           </button>
         ) : messages.length > 0 ? (
           <div className="self-center rounded-full bg-white/8 px-3.5 py-1 text-[11.5px] text-muted">
             {meta?.loading ? "Loading…" : "Beginning of history"}
           </div>
+        ) : meta?.loading ? (
+          <div className="flex flex-col items-center gap-2 px-4 py-10 text-[12.5px] text-muted">
+            <Spinner className="size-5" />
+            Loading messages…
+          </div>
         ) : (
-          <EmptyState>{meta?.loading ? "Loading messages…" : "No messages in this chat yet."}</EmptyState>
+          <EmptyState>No messages in this chat yet.</EmptyState>
         )}
         {messages.map((m) => (m.kind === "promo" ? <PromoCard key={m.id} time={m.time} /> : <MessageBubble key={m.id} chatId={id} m={m} />))}
       </div>
