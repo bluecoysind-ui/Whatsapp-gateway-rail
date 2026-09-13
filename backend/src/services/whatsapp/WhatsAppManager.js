@@ -1,6 +1,7 @@
 const path = require('path');
 const fs = require('fs');
 const WhatsAppSession = require('./WhatsAppSession');
+const wsManager = require('../websocket/WebSocketManager');
 
 /**
  * WhatsApp Manager Class
@@ -128,6 +129,9 @@ class WhatsAppManager {
 
         await session.logout();
         this.sessions.delete(sessionId);
+        // Dashboards drop the account on this; the close handler already sent
+        // session.disconnected if it was online.
+        wsManager.emitSessionStatus(sessionId, 'deleted');
         return { success: true, message: 'Session deleted successfully' };
     }
 

@@ -6,7 +6,7 @@ const wsManager = require('../websocket/WebSocketManager');
 const MAX_RECIPIENTS = Number(process.env.BULK_MAX_RECIPIENTS) || 100;
 /** Jobs kept per session in the history file (oldest are dropped). */
 const MAX_JOBS_PER_SESSION = Number(process.env.BULK_MAX_JOBS_PER_SESSION) || 100;
-/** How long a running job waits for a dropped session to come back (ms). */
+/** How long a running job waits for a dropped lane to come back (ms). */
 const RECONNECT_WAIT_MS = Number(process.env.BULK_RECONNECT_WAIT_MS) || 60_000;
 /** Minimum gap between history-file writes while a job is running (ms). */
 const PERSIST_THROTTLE_MS = 2_000;
@@ -17,15 +17,22 @@ const TERMINAL = new Set(['completed', 'cancelled', 'interrupted']);
  * Bulk Job Manager (Singleton)
  *
  * Owns every bulk-send job: validation, the background send loop, progress
- * broadcasting (WebSocket + webhooks) and on-disk history. Jobs live in
- * `sessions/<sessionId>/bulk-jobs.json` next to the session's config, so a
- * restart keeps the history and marks whatever was mid-flight as
- * `interrupted` instead of silently forgetting it.
+ * broadcasting (WebSocket + webhooks) and on-disk history.
+ *
+ * Multi-account campaigns: a job can be given more than one connected session
+ * ("lanes"). Recipients are then sent round-robin across the lanes, so the load
+ * is spread over several numbers — and because each session carries its own
+ * proxy, consecutive messages naturally leave through different IPs. A lane that
+ * drops mid-campaign is skipped while the others keep sending.
+ *
+ * The job is *owned* by its first lane (`sessionId`), which is where its history
+ * lives (`sessions/<sessionId>/bulk-jobs.json`); `sessionIds` lists every lane
+ * and each recipient's `via` records which account actually sent it.
  *
  * Job status lifecycle:
  *   processing -> completed    every recipient attempted (sent or failed)
  *              -> cancelled    cancel requested; remaining marked `skipped`
- *              -> interrupted  session stayed disconnected / server restarted
+ *              -> interrupted  every lane stayed disconnected / server restarted
  */
 class BulkJobManager {
     constructor() {
@@ -39,7 +46,7 @@ class BulkJobManager {
 
     /**
      * Validate the request and start a job in the background.
-     * @param {WhatsAppSession} session - connected session that will send
+     * @param {WhatsAppSession|WhatsAppSession[]} sessions - connected session(s) that will send
      * @param {Object} input
      * @param {'text'|'image'|'document'} input.type
      * @param {string[]} input.recipients - phone numbers or JIDs
@@ -48,7 +55,12 @@ class BulkJobManager {
      * @param {string} [input.name] - optional label shown in the dashboard
      * @returns {{ success: boolean, message?: string, job?: Object }}
      */
-    createJob(session, input) {
+    createJob(sessions, input) {
+        const lanes = (Array.isArray(sessions) ? sessions : [sessions]).filter(Boolean);
+        if (lanes.length === 0) {
+            return { success: false, message: 'No session to send from' };
+        }
+
         const validation = this._validate(input);
         if (!validation.success) return validation;
 
@@ -56,9 +68,23 @@ class BulkJobManager {
         const jobId = `bulk_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
         const now = new Date().toISOString();
 
+        // Per-lane tally, in the order they were given (that is the rotation order).
+        const perSession = {};
+        for (const s of lanes) {
+            perSession[s.sessionId] = {
+                name: s.name || null,
+                phoneNumber: s.phoneNumber || null,
+                sent: 0,
+                failed: 0
+            };
+        }
+
         const job = {
             jobId,
-            sessionId: session.sessionId,
+            sessionId: lanes[0].sessionId, // owner (where history is stored)
+            sessionIds: lanes.map((s) => s.sessionId),
+            rotation: lanes.length > 1 ? 'round-robin' : 'single',
+            perSession,
             type,
             name: name || null,
             status: 'processing',
@@ -75,17 +101,19 @@ class BulkJobManager {
             startedAt: now,
             completedAt: null,
             error: null,
-            // runtime-only, never persisted
-            _cancelRequested: false
+            // runtime-only, never persisted (see toPublic — underscore keys are stripped)
+            _cancelRequested: false,
+            _sessions: lanes,
+            _rrIndex: 0
         };
 
         this.jobs.set(jobId, job);
         this._persist(job.sessionId, true);
 
         // Fire and forget — the HTTP response must not wait for the sends.
-        this._run(job, session).catch((error) => {
+        this._run(job).catch((error) => {
             console.error(`[${job.sessionId}] Bulk job ${jobId} crashed:`, error);
-            this._finish(job, session, 'interrupted', error.message);
+            this._finish(job, 'interrupted', error.message);
         });
 
         return { success: true, job: this.toPublic(job) };
@@ -97,11 +125,13 @@ class BulkJobManager {
         return job ? this.toPublic(job) : undefined;
     }
 
-    /** Newest-first summaries (no details) for one session. */
+    /** Newest-first summaries (no details) for a session — as owner or as a lane. */
     listJobs(sessionId, limit = 50) {
         const jobs = [];
         for (const job of this.jobs.values()) {
-            if (job.sessionId === sessionId) jobs.push(this.toSummary(job));
+            if (job.sessionId === sessionId || (job.sessionIds && job.sessionIds.includes(sessionId))) {
+                jobs.push(this.toSummary(job));
+            }
         }
         jobs.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
         return jobs.slice(0, limit);
@@ -130,10 +160,14 @@ class BulkJobManager {
             .map((d) => d.recipient);
     }
 
-    /** Public view: everything except runtime flags. */
+    /** Public view: everything except runtime (underscore) fields. */
     toPublic(job) {
-        const { _cancelRequested, ...rest } = job;
-        return { ...rest, cancelRequested: Boolean(_cancelRequested) };
+        const out = {};
+        for (const [key, value] of Object.entries(job)) {
+            if (!key.startsWith('_')) out[key] = value;
+        }
+        out.cancelRequested = Boolean(job._cancelRequested);
+        return out;
     }
 
     /** List view: drop the heavy arrays. */
@@ -220,48 +254,56 @@ class BulkJobManager {
 
     // ==================== SEND LOOP ====================
 
-    async _run(job, session) {
+    async _run(job) {
         const { delayBetweenMessages, delayJitter, typingTime } = job.options;
 
         for (let i = 0; i < job.recipients.length; i++) {
             if (job._cancelRequested) {
                 this._skipRemaining(job, i, 'Cancelled');
-                return this._finish(job, session, 'cancelled');
+                return this._finish(job, 'cancelled');
             }
 
-            // A dropped socket mid-campaign should pause, not burn through the list.
-            if (session.connectionStatus !== 'connected') {
-                const back = await this._waitForConnection(session, job);
+            // Pick the next connected lane. If every lane is down, pause instead
+            // of burning through the list as failures.
+            let lane = this._pickLane(job);
+            if (!lane) {
+                const back = await this._waitForPool(job);
                 if (job._cancelRequested) {
                     this._skipRemaining(job, i, 'Cancelled');
-                    return this._finish(job, session, 'cancelled');
+                    return this._finish(job, 'cancelled');
                 }
                 if (!back) {
-                    this._skipRemaining(job, i, 'Session disconnected');
-                    return this._finish(job, session, 'interrupted', 'Session disconnected');
+                    this._skipRemaining(job, i, 'All sending accounts disconnected');
+                    return this._finish(job, 'interrupted', 'All sending accounts disconnected');
                 }
+                lane = this._pickLane(job);
             }
 
             const recipient = job.recipients[i];
             let result;
             try {
-                result = await this._send(session, job, recipient, typingTime);
+                result = await this._send(lane, job, recipient, typingTime);
             } catch (error) {
                 result = { success: false, message: error.message };
             }
 
+            const tally = job.perSession[lane.sessionId];
             if (result?.success) {
                 job.sent++;
+                if (tally) tally.sent++;
                 job.details.push({
                     recipient,
+                    via: lane.sessionId,
                     status: 'sent',
                     messageId: result.data?.messageId,
                     timestamp: new Date().toISOString()
                 });
             } else {
                 job.failed++;
+                if (tally) tally.failed++;
                 job.details.push({
                     recipient,
+                    via: lane.sessionId,
                     status: 'failed',
                     error: result?.message || 'Unknown error',
                     timestamp: new Date().toISOString()
@@ -278,7 +320,25 @@ class BulkJobManager {
             }
         }
 
-        this._finish(job, session, 'completed');
+        this._finish(job, 'completed');
+    }
+
+    /**
+     * Next connected lane in round-robin order, skipping any that are offline.
+     * Advances the rotation cursor only when a usable lane is found, so a
+     * temporarily-down account does not permanently shift the rotation.
+     */
+    _pickLane(job) {
+        const lanes = job._sessions || [];
+        for (let k = 0; k < lanes.length; k++) {
+            const idx = (job._rrIndex + k) % lanes.length;
+            const lane = lanes[idx];
+            if (lane && lane.connectionStatus === 'connected') {
+                job._rrIndex = (idx + 1) % lanes.length;
+                return lane;
+            }
+        }
+        return null;
     }
 
     _send(session, job, recipient, typingTime) {
@@ -299,12 +359,12 @@ class BulkJobManager {
         const now = new Date().toISOString();
         for (let i = fromIndex; i < job.recipients.length; i++) {
             job.skipped++;
-            job.details.push({ recipient: job.recipients[i], status: 'skipped', error: reason, timestamp: now });
+            job.details.push({ recipient: job.recipients[i], via: null, status: 'skipped', error: reason, timestamp: now });
         }
         job.progress = 100;
     }
 
-    _finish(job, session, status, error = null) {
+    _finish(job, status, error = null) {
         if (TERMINAL.has(job.status)) return;
         job.status = status;
         job.error = error;
@@ -314,11 +374,13 @@ class BulkJobManager {
 
         const summary = this.toSummary(job);
         wsManager.emitToSession(job.sessionId, 'bulk.completed', { job: summary });
-        if (session && typeof session._sendWebhook === 'function') {
-            session._sendWebhook('bulk.completed', summary);
+        const owner = (job._sessions || []).find((s) => s.sessionId === job.sessionId) || (job._sessions || [])[0];
+        if (owner && typeof owner._sendWebhook === 'function') {
+            owner._sendWebhook('bulk.completed', summary);
         }
         console.log(
-            `📤 Bulk ${job.type} job ${job.jobId} ${status}. Sent: ${job.sent}, Failed: ${job.failed}, Skipped: ${job.skipped}`
+            `📤 Bulk ${job.type} job ${job.jobId} ${status} across ${job.sessionIds.length} account(s). ` +
+            `Sent: ${job.sent}, Failed: ${job.failed}, Skipped: ${job.skipped}`
         );
     }
 
@@ -329,15 +391,16 @@ class BulkJobManager {
         });
     }
 
-    /** Poll the session until it reconnects, gives up after RECONNECT_WAIT_MS. */
-    async _waitForConnection(session, job) {
+    /** Poll until at least one lane reconnects; give up after RECONNECT_WAIT_MS. */
+    async _waitForPool(job) {
         const deadline = Date.now() + RECONNECT_WAIT_MS;
+        const anyConnected = () => (job._sessions || []).some((s) => s.connectionStatus === 'connected');
         while (Date.now() < deadline) {
             if (job._cancelRequested) return false;
-            if (session.connectionStatus === 'connected') return true;
+            if (anyConnected()) return true;
             await this._sleep(1000, job);
         }
-        return session.connectionStatus === 'connected';
+        return anyConnected();
     }
 
     /** Sleep in short slices so a cancel does not wait out a long delay. */
@@ -359,8 +422,8 @@ class BulkJobManager {
     }
 
     /**
-     * Write the session's job history. Throttled while jobs are running so a
-     * 100-recipient job does not rewrite the file 100 times a minute; `force`
+     * Write the owner session's job history. Throttled while jobs are running so
+     * a 100-recipient job does not rewrite the file 100 times a minute; `force`
      * is used for create/finish so those states always land on disk.
      */
     _persist(sessionId, force = false) {
@@ -427,13 +490,18 @@ class BulkJobManager {
 
                 let interrupted = 0;
                 for (const stored of jobs) {
-                    if (!stored?.jobId) continue;
+                    if (!stored?.jobId || this.jobs.has(stored.jobId)) continue;
                     const job = {
                         ...stored,
+                        sessionIds: stored.sessionIds || [stored.sessionId],
+                        perSession: stored.perSession || {},
                         recipients: stored.recipients || [],
                         details: stored.details || [],
                         skipped: stored.skipped || 0,
-                        _cancelRequested: false
+                        // runtime fields — the loop is never resumed, so no lanes are attached
+                        _cancelRequested: false,
+                        _sessions: [],
+                        _rrIndex: 0
                     };
                     delete job.cancelRequested;
                     if (!TERMINAL.has(job.status)) {

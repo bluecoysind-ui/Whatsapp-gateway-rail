@@ -538,6 +538,216 @@
 
 /**
  * @swagger
+ * /api/whatsapp/chats/send-video:
+ *   post:
+ *     tags: [Messaging]
+ *     summary: Send video
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [sessionId, chatId, videoUrl]
+ *             properties:
+ *               sessionId:
+ *                 type: string
+ *               chatId:
+ *                 type: string
+ *               videoUrl:
+ *                 type: string
+ *                 description: Direct URL, or a /media/... URL returned by POST /media/upload
+ *               caption:
+ *                 type: string
+ *               gifPlayback:
+ *                 type: boolean
+ *               typingTime:
+ *                 type: integer
+ *               replyTo:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Video sent
+ */
+
+/**
+ * @swagger
+ * /api/whatsapp/media/upload:
+ *   post:
+ *     tags: [Messaging]
+ *     summary: Upload a file
+ *     description: |
+ *       Stores the file under `public/media/<sessionId>/uploads/` and returns its `/media/...` URL,
+ *       which can be passed to send-image / send-video / send-document / send-audio or the bulk
+ *       endpoints as the media URL. Send `sessionId` **before** `file` in the form.
+ *       Max size `UPLOAD_MAX_BYTES` (default 64 MB).
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             required: [sessionId, file]
+ *             properties:
+ *               sessionId:
+ *                 type: string
+ *               file:
+ *                 type: string
+ *                 format: binary
+ *     responses:
+ *       200:
+ *         description: Uploaded
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     url:
+ *                       type: string
+ *                       example: /media/mysession/uploads/1700000000000-abc123-brochure.pdf
+ *                     filename:
+ *                       type: string
+ *                     mimetype:
+ *                       type: string
+ *                     size:
+ *                       type: integer
+ *       400:
+ *         description: Missing file / too large / bad sessionId
+ *       404:
+ *         description: Session not found
+ */
+
+/**
+ * @swagger
+ * /api/whatsapp/chats/send-media:
+ *   post:
+ *     tags: [Messaging]
+ *     summary: Upload and send a file in one request
+ *     description: |
+ *       The WhatsApp message kind follows the file's mimetype — `image/*` → image, `video/*` → video,
+ *       `audio/*` → audio (voice note with `ptt=true`), anything else → document. Pass `asDocument=true`
+ *       to send an image/video as a file instead. Send `sessionId` **before** `file` in the form.
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             required: [sessionId, chatId, file]
+ *             properties:
+ *               sessionId:
+ *                 type: string
+ *               chatId:
+ *                 type: string
+ *               file:
+ *                 type: string
+ *                 format: binary
+ *               caption:
+ *                 type: string
+ *               typingTime:
+ *                 type: integer
+ *               replyTo:
+ *                 type: string
+ *               ptt:
+ *                 type: boolean
+ *               asDocument:
+ *                 type: boolean
+ *     responses:
+ *       200:
+ *         description: Sent
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     messageId:
+ *                       type: string
+ *                     chatId:
+ *                       type: string
+ *                     type:
+ *                       type: string
+ *                       enum: [image, video, audio, ptt, document]
+ *                     mediaUrl:
+ *                       type: string
+ *                     mimetype:
+ *                       type: string
+ *                     filename:
+ *                       type: string
+ *                     caption:
+ *                       type: string
+ *       400:
+ *         description: Missing file / chatId, or session not connected
+ */
+
+/**
+ * @swagger
+ * /api/whatsapp/chats/media:
+ *   post:
+ *     tags: [Chat History]
+ *     summary: Get a message's media (download on first request)
+ *     description: |
+ *       Returns the `/media/...` URL of a message's attachment. Incoming media up to
+ *       `MEDIA_AUTOSAVE_MAX_BYTES` (default 25 MB) is saved as it arrives and already carries
+ *       `mediaUrl` in history; anything else (large videos, messages from before the gateway
+ *       ran) is downloaded from WhatsApp when this is called. The session must be connected
+ *       for a download; already-saved files are returned even while offline.
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [sessionId, chatId, messageId]
+ *             properties:
+ *               sessionId:
+ *                 type: string
+ *               chatId:
+ *                 type: string
+ *                 description: The chat id exactly as returned by /chats/overview
+ *               messageId:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Media available
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     messageId:
+ *                       type: string
+ *                     chatId:
+ *                       type: string
+ *                     url:
+ *                       type: string
+ *                     mimetype:
+ *                       type: string
+ *                     filename:
+ *                       type: string
+ *                     size:
+ *                       type: integer
+ *                       nullable: true
+ *       404:
+ *         description: Message not found, has no media, or could not be downloaded
+ */
+
+/**
+ * @swagger
  * /api/whatsapp/chats/send-audio:
  *   post:
  *     tags: [Messaging]
@@ -1010,11 +1220,18 @@
  *         application/json:
  *           schema:
  *             type: object
- *             required: [sessionId, recipients, message]
+ *             required: [recipients, message]
  *             properties:
+ *               sessionIds:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *                 example: ["accountA", "accountB"]
+ *                 description: Accounts to send from — recipients are rotated round-robin across them (each uses its own proxy). Use this or sessionId.
  *               sessionId:
  *                 type: string
  *                 example: mysession
+ *                 description: A single sending account (equivalent to sessionIds with one entry)
  *               recipients:
  *                 type: array
  *                 items:
@@ -1084,8 +1301,13 @@
  *         application/json:
  *           schema:
  *             type: object
- *             required: [sessionId, recipients, imageUrl]
+ *             required: [recipients, imageUrl]
  *             properties:
+ *               sessionIds:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *                 description: Accounts to send from — round-robin rotation. Use this or sessionId.
  *               sessionId:
  *                 type: string
  *                 example: mysession
@@ -1152,8 +1374,13 @@
  *         application/json:
  *           schema:
  *             type: object
- *             required: [sessionId, recipients, documentUrl, filename]
+ *             required: [recipients, documentUrl, filename]
  *             properties:
+ *               sessionIds:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *                 description: Accounts to send from — round-robin rotation. Use this or sessionId.
  *               sessionId:
  *                 type: string
  *                 example: mysession

@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState, type ButtonHTMLAttributes, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ButtonHTMLAttributes, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import type { ChatPreview } from "@/lib/gateway-types";
+import type { Bubble, BubbleMedia, ChatPreview } from "@/lib/gateway-types";
 import { type GatewaySession } from "@/lib/gateway-client";
 import { cn } from "@/lib/cn";
 import { useGateway } from "@/store/gateway-store";
@@ -355,11 +355,15 @@ function emptyChatsMessage(total: number, query: string): string {
 
 function ChatList() {
   const chats = useGateway((s) => s.chats);
+  const chatsHasMore = useGateway((s) => s.chatsHasMore);
+  const chatsLoading = useGateway((s) => s.chatsLoading);
+  const loadMoreChats = useGateway((s) => s.loadMoreChats);
   const filter = useGateway((s) => s.filter);
   const setFilter = useGateway((s) => s.setFilter);
   const active = useGateway((s) => s.activeChatId);
   const select = useGateway((s) => s.selectChat);
   const query = useGateway((s) => s.query);
+  const account = useGateway((s) => s.sessions.find((x) => x.sessionId === s.activeAccountId));
   const filtered = useMemo(() => {
     return chats.filter((c) => {
       if (filter === "unread" && c.unread === 0) return false;
@@ -371,8 +375,15 @@ function ChatList() {
   return (
     <section className="glass flex h-full flex-col rounded-2xl">
       <div className="flex items-center justify-between px-4 pt-4 pb-2">
-        <div className="flex items-center gap-1 text-[16px] font-semibold">
-          All Chats <span className="text-xs text-muted">▾</span>
+        <div className="min-w-0">
+          <div className="flex items-center gap-1 text-[16px] font-semibold">All Chats</div>
+          {account ? (
+            <div className="truncate text-[11px] text-muted">
+              {account.name || account.sessionId}
+              {account.phoneNumber ? ` · ${account.phoneNumber}` : ""}
+              {account.status !== "connected" ? ` · ${account.status}` : ""}
+            </div>
+          ) : null}
         </div>
         <IconBtn className="size-8">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -428,6 +439,16 @@ function ChatList() {
             </div>
           </button>
         ))}
+        {chatsHasMore && !query && filter === "all" ? (
+          <button
+            type="button"
+            disabled={chatsLoading}
+            onClick={() => void loadMoreChats()}
+            className="mt-1 w-full rounded-xl border border-line py-2 text-xs text-muted hover:text-ink disabled:opacity-50"
+          >
+            {chatsLoading ? "Loading…" : "Load more chats"}
+          </button>
+        ) : null}
       </div>
     </section>
   );
@@ -491,13 +512,40 @@ function Conversation() {
   const chats = useGateway((s) => s.chats);
   const threads = useGateway((s) => s.threads);
   const id = useGateway((s) => s.activeChatId);
+  const meta = useGateway((s) => s.threadMeta[s.activeChatId]);
+  const loadOlder = useGateway((s) => s.loadOlderMessages);
   const composer = useGateway((s) => s.composer);
   const setComposer = useGateway((s) => s.setComposer);
   const send = useGateway((s) => s.sendComposer);
+  const sendAttachment = useGateway((s) => s.sendAttachment);
   const setMobilePane = useGateway((s) => s.setMobilePane);
   const openOverlay = useGateway((s) => s.openOverlay);
   const chat = chats.find((c) => c.id === id);
   const messages = threads[id] ?? [];
+  const [attachment, setAttachment] = useState<File | null>(null);
+  const [sending, setSending] = useState(false);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const scroller = useRef<HTMLDivElement>(null);
+  const lastId = messages.length ? messages[messages.length - 1].id : "";
+
+  // Stick to the bottom when a new message lands; leave the scroll alone when
+  // older pages are prepended.
+  useEffect(() => {
+    const el = scroller.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [id, lastId]);
+
+  const submit = async () => {
+    if (attachment) {
+      setSending(true);
+      const ok = await sendAttachment(attachment, composer.trim());
+      setSending(false);
+      if (ok) setAttachment(null);
+      return;
+    }
+    await send();
+  };
   if (!chat) {
     return (
       <section className="glass flex h-full min-w-0 flex-1 items-center justify-center rounded-2xl">
@@ -531,56 +579,185 @@ function Conversation() {
           <IconDots />
         </IconBtn>
       </div>
-      <div className="chat-wallpaper scroll-thin flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto px-6 py-5">
-        <div className="self-center rounded-full bg-white/8 px-3.5 py-1 text-[11.5px] text-muted">Today</div>
-        {messages.map((m) =>
-          m.kind === "promo" ? (
-            <PromoCard key={m.id} time={m.time} />
-          ) : (
-            <div key={m.id} className={cn("flex max-w-[68%] flex-col", m.from === "me" ? "self-end" : "self-start")}>
-              <div
-                className={cn(
-                  "rounded-2xl px-3.5 py-2.5 text-[13.5px] leading-relaxed",
-                  m.from === "me"
-                    ? "rounded-br-sm bg-gradient-to-br from-wa to-wa-deep text-white"
-                    : "rounded-bl-sm bg-bubble-in",
-                )}
-              >
-                {m.text}
-              </div>
-              <div className={cn("mt-0.5 px-1 text-[10.5px] text-dim", m.from === "me" && "text-right")}>
-                {m.time}
-                {m.from === "me" ? " ✓✓" : ""}
-              </div>
-            </div>
-          ),
+      <div ref={scroller} className="chat-wallpaper scroll-thin flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto px-6 py-5">
+        {meta?.hasMore ? (
+          <button
+            type="button"
+            disabled={meta.loading}
+            onClick={() => void loadOlder(id)}
+            className="self-center rounded-full border border-line bg-white/8 px-3.5 py-1 text-[11.5px] text-muted hover:text-ink disabled:opacity-50"
+          >
+            {meta.loading ? "Loading…" : "Load older messages"}
+          </button>
+        ) : messages.length > 0 ? (
+          <div className="self-center rounded-full bg-white/8 px-3.5 py-1 text-[11.5px] text-muted">
+            {meta?.loading ? "Loading…" : "Beginning of history"}
+          </div>
+        ) : (
+          <EmptyState>{meta?.loading ? "Loading messages…" : "No messages in this chat yet."}</EmptyState>
         )}
+        {messages.map((m) => (m.kind === "promo" ? <PromoCard key={m.id} time={m.time} /> : <MessageBubble key={m.id} chatId={id} m={m} />))}
       </div>
       <form
-        className="flex items-center gap-2 border-t border-line px-4 py-3"
+        className="border-t border-line px-4 py-3"
         onSubmit={(e) => {
           e.preventDefault();
-          void send();
+          void submit();
         }}
       >
-        <IconBtn>+</IconBtn>
-        <button type="button" className="grid size-9 place-items-center rounded-[10px] border border-line bg-white/5 text-muted">
-          ☺
-        </button>
-        <input
-          value={composer}
-          onChange={(e) => setComposer(e.target.value)}
-          placeholder="Type a message..."
-          className="h-10 flex-1 rounded-xl border border-line bg-white/5 px-4 text-[13.5px] text-ink outline-none placeholder:text-dim"
-        />
-        <button
-          type="submit"
-          className="grid size-10 place-items-center rounded-xl bg-gradient-to-br from-indigo to-violet text-white shadow-[0_4px_14px_rgba(99,102,241,0.4)]"
-        >
-          <IconSend />
-        </button>
+        {attachment ? (
+          <div className="mb-2 flex items-center gap-3 rounded-xl border border-line bg-white/5 px-3 py-2 text-[12.5px]">
+            <span className="text-lg">{attachment.type.startsWith("image/") ? "🖼️" : attachment.type.startsWith("video/") ? "🎬" : attachment.type.startsWith("audio/") ? "🎵" : "📄"}</span>
+            <div className="min-w-0 flex-1">
+              <div className="truncate font-medium">{attachment.name}</div>
+              <div className="text-[11px] text-muted">
+                {fmtBytes(attachment.size)} · {attachment.type || "file"} — add a caption below, then send
+              </div>
+            </div>
+            <button type="button" className="text-xs text-danger" onClick={() => setAttachment(null)}>
+              Remove
+            </button>
+          </div>
+        ) : null}
+        <div className="flex items-center gap-2">
+          <input
+            ref={fileInput}
+            type="file"
+            hidden
+            accept="image/*,video/*,audio/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.zip"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) setAttachment(f);
+              e.target.value = "";
+            }}
+          />
+          <IconBtn type="button" title="Attach image, video, audio or document" onClick={() => fileInput.current?.click()}>
+            📎
+          </IconBtn>
+          <input
+            value={composer}
+            onChange={(e) => setComposer(e.target.value)}
+            placeholder={attachment ? "Caption (optional)…" : "Type a message..."}
+            className="h-10 min-w-0 flex-1 rounded-xl border border-line bg-white/5 px-4 text-[13.5px] text-ink outline-none placeholder:text-dim"
+          />
+          <button
+            type="submit"
+            disabled={sending || (!attachment && !composer.trim())}
+            className="grid size-10 place-items-center rounded-xl bg-gradient-to-br from-indigo to-violet text-white shadow-[0_4px_14px_rgba(99,102,241,0.4)] disabled:opacity-50"
+          >
+            {sending ? "…" : <IconSend />}
+          </button>
+        </div>
       </form>
     </section>
+  );
+}
+
+function fmtBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function MessageBubble({ chatId, m }: { chatId: string; m: Extract<Bubble, { kind: "text" }> }) {
+  const mine = m.from === "me";
+  return (
+    <div className={cn("flex max-w-[68%] flex-col", mine ? "self-end" : "self-start")}>
+      <div
+        className={cn(
+          "overflow-hidden rounded-2xl text-[13.5px] leading-relaxed",
+          mine ? "rounded-br-sm bg-gradient-to-br from-wa to-wa-deep text-white" : "rounded-bl-sm bg-bubble-in",
+          m.pending && "opacity-70",
+        )}
+      >
+        {m.sender ? <div className="px-3.5 pt-2 text-[11px] font-semibold text-indigo-200">{m.sender}</div> : null}
+        {m.media ? <MediaView chatId={chatId} messageId={m.id} media={m.media} mine={mine} /> : null}
+        {m.text ? <div className="px-3.5 py-2.5 whitespace-pre-wrap break-words">{m.text}</div> : null}
+      </div>
+      <div className={cn("mt-0.5 px-1 text-[10.5px] text-dim", mine && "text-right")}>
+        {m.time}
+        {mine ? (m.pending ? " ◌" : " ✓✓") : ""}
+      </div>
+    </div>
+  );
+}
+
+/** Render an attachment inline, or offer to fetch it from WhatsApp when it is not on the server yet. */
+function MediaView({ chatId, messageId, media, mine }: { chatId: string; messageId: string; media: BubbleMedia; mine: boolean }) {
+  const loadMedia = useGateway((s) => s.loadMedia);
+  const name = media.filename || `${media.type}-${messageId}`;
+  const download = media.url ? (
+    <a
+      href={media.url}
+      download={name}
+      target="_blank"
+      rel="noreferrer"
+      className={cn("text-[11px] underline underline-offset-2", mine ? "text-white/90" : "text-indigo")}
+    >
+      Download
+    </a>
+  ) : null;
+
+  if (!media.url) {
+    const label = { image: "Photo", video: "Video", audio: "Audio", ptt: "Voice message", document: media.filename || "Document", sticker: "Sticker" }[media.type];
+    return (
+      <div className="flex items-center gap-3 px-3.5 py-2.5">
+        <span className="text-lg">{{ image: "🖼️", video: "🎬", audio: "🎵", ptt: "🎤", document: "📄", sticker: "🏷️" }[media.type]}</span>
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-[12.5px]">{label}</div>
+          <button
+            type="button"
+            disabled={media.loading}
+            onClick={() => void loadMedia(chatId, messageId)}
+            className={cn("text-[11px] underline underline-offset-2 disabled:opacity-60", mine ? "text-white/90" : "text-indigo")}
+          >
+            {media.loading ? "Fetching from WhatsApp…" : "Load"}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (media.type === "image" || media.type === "sticker") {
+    return (
+      <div>
+        <a href={media.url} target="_blank" rel="noreferrer">
+          <img src={media.url} alt={media.filename ?? ""} className={cn("block max-h-72 w-auto max-w-full object-contain", media.type === "sticker" ? "max-h-32 p-2" : "")} />
+        </a>
+        <div className="px-3.5 pt-1.5 pb-1">{download}</div>
+      </div>
+    );
+  }
+  if (media.type === "video") {
+    return (
+      <div>
+        <video src={media.url} controls preload="metadata" className="block max-h-72 w-full" />
+        <div className="px-3.5 pt-1.5 pb-1">{download}</div>
+      </div>
+    );
+  }
+  if (media.type === "audio" || media.type === "ptt") {
+    return (
+      <div className="px-3.5 py-2">
+        <audio src={media.url} controls preload="metadata" className="w-64 max-w-full" />
+        <div className="pt-1">{download}</div>
+      </div>
+    );
+  }
+  return (
+    <a
+      href={media.url}
+      download={name}
+      target="_blank"
+      rel="noreferrer"
+      className={cn("flex items-center gap-3 px-3.5 py-2.5 hover:bg-white/5", mine ? "text-white" : "")}
+    >
+      <span className="text-lg">📄</span>
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-[12.5px] font-medium">{media.filename || "Document"}</span>
+        <span className={cn("block text-[11px]", mine ? "text-white/80" : "text-muted")}>{media.mimetype || "file"} · click to download</span>
+      </span>
+    </a>
   );
 }
 
@@ -610,11 +787,21 @@ function PromoCard({ time }: { time: string }) {
 function ContactPanel() {
   const chats = useGateway((s) => s.chats);
   const id = useGateway((s) => s.activeChatId);
+  const thread = useGateway((s) => s.threads[s.activeChatId]);
   const tab = useGateway((s) => s.contactTab);
   const setTab = useGateway((s) => s.setContactTab);
   const openOverlay = useGateway((s) => s.openOverlay);
   const chat = chats.find((c) => c.id === id);
+  const attachments = useMemo(
+    () =>
+      (thread ?? [])
+        .filter((b): b is Extract<Bubble, { kind: "text" }> => b.kind === "text" && Boolean(b.media))
+        .reverse(),
+    [thread],
+  );
   if (!chat) return null;
+  const visual = attachments.filter((b) => b.media && ["image", "video", "sticker"].includes(b.media.type));
+  const files = attachments.filter((b) => b.media && ["document", "audio", "ptt"].includes(b.media.type));
   return (
     <aside className="glass scroll-thin flex h-full flex-col overflow-auto rounded-2xl p-5">
       <div className="text-center">
@@ -677,10 +864,52 @@ function ContactPanel() {
             Block Contact
           </button>
         </>
+      ) : tab === "media" || tab === "files" ? (
+        <AttachmentList chatId={id} items={tab === "media" ? visual : files} empty={`No ${tab} in the loaded history`} />
       ) : (
         <p className="mt-8 text-center text-sm text-muted">No {tab} yet</p>
       )}
     </aside>
+  );
+}
+
+/** Attachments of the open conversation (what is loaded so far), newest first, each downloadable. */
+function AttachmentList({ chatId, items, empty }: { chatId: string; items: Array<Extract<Bubble, { kind: "text" }>>; empty: string }) {
+  const loadMedia = useGateway((s) => s.loadMedia);
+  if (items.length === 0) return <p className="mt-8 text-center text-sm text-muted">{empty}</p>;
+  return (
+    <div className="mt-3 space-y-1.5">
+      {items.map((b) => {
+        const media = b.media!;
+        const name = media.filename || `${media.type}-${b.id}`;
+        return (
+          <div key={b.id} className="flex items-center gap-2.5 rounded-xl border border-line bg-white/4 px-2.5 py-2">
+            {media.url && (media.type === "image" || media.type === "sticker") ? (
+              <img src={media.url} alt="" className="size-10 shrink-0 rounded-lg object-cover" />
+            ) : (
+              <span className="grid size-10 shrink-0 place-items-center rounded-lg bg-white/8 text-base">
+                {{ image: "🖼️", video: "🎬", audio: "🎵", ptt: "🎤", document: "📄", sticker: "🏷️" }[media.type]}
+              </span>
+            )}
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-[12px] font-medium">{media.filename || b.text || media.type}</div>
+              <div className="text-[10.5px] text-muted">
+                {b.time} · {b.from === "me" ? "sent" : "received"}
+              </div>
+            </div>
+            {media.url ? (
+              <a href={media.url} download={name} target="_blank" rel="noreferrer" className="shrink-0 text-[11px] text-indigo underline underline-offset-2">
+                Download
+              </a>
+            ) : (
+              <button type="button" disabled={media.loading} onClick={() => void loadMedia(chatId, b.id)} className="shrink-0 text-[11px] text-indigo underline underline-offset-2 disabled:opacity-60">
+                {media.loading ? "…" : "Load"}
+              </button>
+            )}
+          </div>
+        );
+      })}
+    </div>
   );
 }
 

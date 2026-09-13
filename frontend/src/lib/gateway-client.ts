@@ -51,6 +51,7 @@ export const API_ENDPOINTS: EndpointDef[] = [
   { group: "Messaging", value: "POST|/api/whatsapp/chats/send-text", label: "POST /chats/send-text" },
   { group: "Messaging", value: "POST|/api/whatsapp/chats/send-image", label: "POST /chats/send-image" },
   { group: "Messaging", value: "POST|/api/whatsapp/chats/send-document", label: "POST /chats/send-document" },
+  { group: "Messaging", value: "POST|/api/whatsapp/chats/send-video", label: "POST /chats/send-video" },
   { group: "Messaging", value: "POST|/api/whatsapp/chats/send-audio", label: "POST /chats/send-audio" },
   { group: "Messaging", value: "POST|/api/whatsapp/chats/send-location", label: "POST /chats/send-location" },
   { group: "Messaging", value: "POST|/api/whatsapp/chats/send-contact", label: "POST /chats/send-contact" },
@@ -67,6 +68,7 @@ export const API_ENDPOINTS: EndpointDef[] = [
   { group: "History", value: "POST|/api/whatsapp/chats/overview", label: "POST /chats/overview" },
   { group: "History", value: "POST|/api/whatsapp/contacts", label: "POST /contacts" },
   { group: "History", value: "POST|/api/whatsapp/chats/messages", label: "POST /chats/messages" },
+  { group: "History", value: "POST|/api/whatsapp/chats/media", label: "POST /chats/media - Fetch a message's media" },
   { group: "Groups", value: "POST|/api/whatsapp/groups", label: "POST /groups" },
   { group: "Groups", value: "POST|/api/whatsapp/groups/create", label: "POST /groups/create" },
   { group: "System", value: "GET|/api/websocket/stats", label: "GET /websocket/stats" },
@@ -81,6 +83,24 @@ export function sampleBodyFor(path: string, method: string): { body: unknown | n
     return {
       body: { sessionId: "", chatId: "628123456789", message: "Hello from WA Gateway!", typingTime: 0, replyTo: null },
       help: "chatId: phone or group ID. typingTime in ms. replyTo is optional.",
+    };
+  }
+  if (path.includes("/send-video")) {
+    return {
+      body: { sessionId: "", chatId: "628123456789", videoUrl: "https://example.com/clip.mp4", caption: "Caption" },
+      help: "videoUrl: direct URL, or a /media/... URL returned by POST /media/upload.",
+    };
+  }
+  if (path.includes("/chats/media")) {
+    return {
+      body: { sessionId: "", chatId: "628123456789@c.us", messageId: "" },
+      help: "Returns the /media/... URL of a message's attachment, downloading it from WhatsApp on first request.",
+    };
+  }
+  if (path.includes("/chats/messages")) {
+    return {
+      body: { sessionId: "", chatId: "628123456789@c.us", limit: 50, cursor: null },
+      help: "Newest first. Pass the returned `cursor` (oldest message id) to page further back.",
     };
   }
   if (path.includes("/send-image")) {
@@ -224,7 +244,11 @@ export async function sendText(payload: { sessionId: string; chatId: string; mes
     method: "POST",
     body: JSON.stringify(payload),
   });
-  return response.json() as Promise<{ success: boolean; message?: string }>;
+  return response.json() as Promise<{
+    success: boolean;
+    message?: string;
+    data?: { messageId: string; chatId: string; timestamp: string };
+  }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -247,16 +271,26 @@ export type BulkOptions = {
 
 export type BulkJobDetail = {
   recipient: string;
+  /** Which account sent (or would have sent) this recipient. */
+  via?: string | null;
   status: "sent" | "failed" | "skipped";
   messageId?: string;
   error?: string;
   timestamp: string;
 };
 
+/** Per-account tally inside a multi-account campaign. */
+export type BulkPerSession = Record<string, { name: string | null; phoneNumber: string | null; sent: number; failed: number }>;
+
 /** Row of POST /chats/bulk-jobs — no per-recipient arrays. */
 export type BulkJobSummary = {
   jobId: string;
+  /** Owner account (where the job's history lives). */
   sessionId: string;
+  /** Every account in the rotation. */
+  sessionIds: string[];
+  rotation: "single" | "round-robin";
+  perSession: BulkPerSession;
   type: BulkJobType;
   name: string | null;
   status: BulkJobStatus;
@@ -281,7 +315,8 @@ export type BulkJob = BulkJobSummary & {
 };
 
 export type StartBulkInput = {
-  sessionId: string;
+  /** Accounts to send from; recipients are spread round-robin across them. */
+  sessionIds: string[];
   type: BulkJobType;
   recipients: string[];
   payload: BulkPayload;
@@ -292,7 +327,15 @@ export type StartBulkInput = {
 type BulkStartResponse = {
   success: boolean;
   message?: string;
-  data?: { jobId: string; total: number; statusUrl: string; retryOf?: string };
+  data?: {
+    jobId: string;
+    total: number;
+    sessionIds?: string[];
+    rotation?: string;
+    skippedSessions?: string[];
+    retryOf?: string;
+    statusUrl: string;
+  };
 };
 
 const BULK_ENDPOINT: Record<BulkJobType, string> = {
@@ -305,7 +348,7 @@ export async function startBulkJob(input: StartBulkInput) {
   const response = await apiFetch(`${API_BASE}${BULK_ENDPOINT[input.type]}`, {
     method: "POST",
     body: JSON.stringify({
-      sessionId: input.sessionId,
+      sessionIds: input.sessionIds,
       recipients: input.recipients,
       name: input.name,
       ...input.payload,
@@ -434,22 +477,31 @@ export type GatewayChat = {
   unreadCount: number;
 };
 
-/** One row of POST /chats/messages. */
+/** One row of POST /chats/messages (and the payload of the `message` socket events). */
 export type GatewayMessage = {
   id: string;
+  chatId: string;
   fromMe: boolean;
+  sender?: string;
+  senderPhone?: string;
   timestamp: number;
+  /** text | image | video | audio | ptt | document | sticker | location | contact | reaction | poll | … */
   type: string;
   /** Reactions arrive as { emoji, targetMessageId }, not a string. */
-  content: string | { emoji?: string; targetMessageId?: string } | null;
+  content: string | { emoji?: string; targetMessageId?: string; [k: string]: unknown } | null;
   caption: string | null;
+  mimetype?: string | null;
+  filename?: string | null;
+  /** `/media/...` URL once the attachment is on the server; null until fetched. */
+  mediaUrl?: string | null;
   senderName: string | null;
+  isGroup?: boolean;
 };
 
-export async function listChats(sessionId: string, limit = 50) {
+export async function listChats(sessionId: string, limit = 50, offset = 0) {
   const response = await apiFetch(`${API_BASE}/chats/overview`, {
     method: "POST",
-    body: JSON.stringify({ sessionId, limit, offset: 0, type: "all" }),
+    body: JSON.stringify({ sessionId, limit, offset, type: "all" }),
   });
   return response.json() as Promise<{
     success: boolean;
@@ -458,14 +510,80 @@ export async function listChats(sessionId: string, limit = 50) {
   }>;
 }
 
-export async function listMessages(sessionId: string, chatId: string, limit = 50) {
+/** Newest first; pass the previous page's `cursor` to go further back. */
+export async function listMessages(sessionId: string, chatId: string, limit = 40, cursor: string | null = null) {
   const response = await apiFetch(`${API_BASE}/chats/messages`, {
     method: "POST",
-    body: JSON.stringify({ sessionId, chatId, limit }),
+    body: JSON.stringify({ sessionId, chatId, limit, cursor }),
   });
   return response.json() as Promise<{
     success: boolean;
     message?: string;
-    data?: { chatId: string; messages: GatewayMessage[] };
+    data?: { chatId: string; messages: GatewayMessage[]; cursor: string | null; hasMore: boolean };
+  }>;
+}
+
+// ---------------------------------------------------------------------------
+// Media (backend: POST /media/upload, /chats/send-media, /chats/media)
+// ---------------------------------------------------------------------------
+
+export type UploadedFile = { url: string; filename: string; mimetype: string; size: number };
+
+/** Multipart requests must not carry a JSON content-type — the browser sets the boundary. */
+function multipartHeaders(): Record<string, string> {
+  const headers = getApiHeaders(false);
+  return headers;
+}
+
+/** Upload a file for a session; the returned `/media/...` URL can be sent later or used in bulk sends. */
+export async function uploadMedia(sessionId: string, file: File) {
+  const form = new FormData();
+  form.append("sessionId", sessionId); // before the file: multer reads it to pick the folder
+  form.append("file", file, file.name);
+  const response = await fetch(`${API_BASE}/media/upload`, { method: "POST", headers: multipartHeaders(), body: form });
+  return response.json() as Promise<{ success: boolean; message?: string; data?: UploadedFile }>;
+}
+
+/** Upload + send in one request. The message kind follows the file's mimetype. */
+export async function sendMediaFile(input: {
+  sessionId: string;
+  chatId: string;
+  file: File;
+  caption?: string;
+  asDocument?: boolean;
+}) {
+  const form = new FormData();
+  form.append("sessionId", input.sessionId);
+  form.append("chatId", input.chatId);
+  if (input.caption) form.append("caption", input.caption);
+  if (input.asDocument) form.append("asDocument", "true");
+  form.append("file", input.file, input.file.name);
+  const response = await fetch(`${API_BASE}/chats/send-media`, { method: "POST", headers: multipartHeaders(), body: form });
+  return response.json() as Promise<{
+    success: boolean;
+    message?: string;
+    data?: {
+      messageId: string;
+      chatId: string;
+      type: string;
+      mediaUrl: string;
+      mimetype: string;
+      filename: string | null;
+      caption: string | null;
+      timestamp: string;
+    };
+  }>;
+}
+
+/** Make sure a history message's attachment is on the server and get its URL. */
+export async function fetchMessageMedia(sessionId: string, chatId: string, messageId: string) {
+  const response = await apiFetch(`${API_BASE}/chats/media`, {
+    method: "POST",
+    body: JSON.stringify({ sessionId, chatId, messageId }),
+  });
+  return response.json() as Promise<{
+    success: boolean;
+    message?: string;
+    data?: { messageId: string; chatId: string; url: string; mimetype: string; filename: string; size: number | null };
   }>;
 }

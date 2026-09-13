@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   getBulkJob,
   listChats,
+  uploadMedia,
   type BulkJob,
   type BulkJobSummary,
   type BulkJobType,
@@ -91,11 +92,18 @@ export function BulkComposer() {
   const closeOverlay = useGateway((s) => s.closeOverlay);
   const live = useGateway((s) => s.live);
 
-  const connected = sessions.filter((s) => s.status === "connected");
-  const [sessionId, setSessionId] = useState(
-    () => pickBulkSession(sessions, bulkSessionId || activeAccountId)?.sessionId ?? "",
-  );
-  const session = sessions.find((s) => s.sessionId === sessionId);
+  const connected = useMemo(() => sessions.filter((s) => s.status === "connected"), [sessions]);
+  // Accounts to send from (rotation order). Default: the one in focus, else all connected.
+  const [laneIds, setLaneIds] = useState<string[]>(() => {
+    const preferred = pickBulkSession(sessions, bulkSessionId || activeAccountId);
+    return preferred && preferred.status === "connected" ? [preferred.sessionId] : connected.map((s) => s.sessionId);
+  });
+  // The chat picker reads chats from the first selected account (or the focus account).
+  const primaryId = laneIds[0] ?? pickBulkSession(sessions, bulkSessionId || activeAccountId)?.sessionId ?? "";
+  const session = sessions.find((s) => s.sessionId === primaryId);
+  const toggleLane = (id: string) =>
+    setLaneIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  const allSelected = connected.length > 0 && connected.every((s) => laneIds.includes(s.sessionId));
 
   // Recipients
   const [source, setSource] = useState<"chats" | "paste">("chats");
@@ -115,6 +123,37 @@ export function BulkComposer() {
   const [filename, setFilename] = useState("");
   const [mimetype, setMimetype] = useState("application/pdf");
   const [caption, setCaption] = useState("");
+
+  // Attach-from-computer: the file is uploaded once and its /media/ URL is what the job sends.
+  const [uploading, setUploading] = useState(false);
+  const [uploadedName, setUploadedName] = useState<{ image?: string; document?: string }>({});
+  const uploadInput = useRef<HTMLInputElement>(null);
+  const pushToast = useGateway((s) => s.pushToast);
+  const pickFile = async (file: File) => {
+    if (!session) return;
+    setUploading(true);
+    try {
+      const r = await uploadMedia(session.sessionId, file);
+      if (!r.success || !r.data) {
+        pushToast("error", r.message || "Upload failed");
+        return;
+      }
+      if (type === "image") {
+        setImageUrl(r.data.url);
+        setUploadedName((u) => ({ ...u, image: r.data!.filename }));
+      } else {
+        setDocumentUrl(r.data.url);
+        setFilename(r.data.filename);
+        setMimetype(r.data.mimetype || "application/octet-stream");
+        setUploadedName((u) => ({ ...u, document: r.data!.filename }));
+      }
+      pushToast("success", `Uploaded ${r.data.filename}`);
+    } catch {
+      pushToast("error", "Gateway unreachable — upload failed");
+    } finally {
+      setUploading(false);
+    }
+  };
 
   // Pacing — defaults deliberately slower than the API's 1s: bursts get numbers flagged.
   const [delay, setDelay] = useState(3000);
@@ -145,10 +184,11 @@ export function BulkComposer() {
     };
   }, [live, session?.sessionId, session?.status]);
 
-  // Switching sessions invalidates the chat selection but not pasted numbers.
+  // The primary account (whose chats fill the picker) changed — drop the chat
+  // selection, not the pasted numbers.
   useEffect(() => {
     setSelected(new Set());
-  }, [sessionId]);
+  }, [primaryId]);
 
   const visibleChats = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -184,9 +224,10 @@ export function BulkComposer() {
       return next;
     });
 
+  const activeLanes = laneIds.filter((id) => sessions.find((s) => s.sessionId === id)?.status === "connected");
   const problem = (() => {
     if (!live) return "Gateway offline";
-    if (!session || session.status !== "connected") return "Pick a connected session";
+    if (activeLanes.length === 0) return "Pick at least one connected account";
     if (recipients.length === 0) return "Add at least one recipient";
     if (recipients.length > MAX_RECIPIENTS) return `Max ${MAX_RECIPIENTS} recipients per campaign`;
     if (type === "text" && !message.trim()) return "Write a message";
@@ -207,7 +248,7 @@ export function BulkComposer() {
           ? { imageUrl: imageUrl.trim(), caption: caption.trim() }
           : { documentUrl: documentUrl.trim(), filename: filename.trim(), mimetype: mimetype.trim() || undefined, caption: caption.trim() };
     await startBulk({
-      sessionId,
+      sessionIds: activeLanes,
       type,
       recipients,
       payload,
@@ -222,24 +263,47 @@ export function BulkComposer() {
       <div className="grid gap-5 md:grid-cols-2">
         {/* ---------------- Recipients ---------------- */}
         <section className="space-y-3">
-          <label className={label}>
-            Send from
-            <select value={sessionId} onChange={(e) => setSessionId(e.target.value)} className={cn(field, "mt-1")}>
-              {sessions.length === 0 ? <option value="">No sessions</option> : null}
-              {sessions.map((s) => (
-                <option key={s.sessionId} value={s.sessionId} disabled={s.status !== "connected"}>
-                  {s.name || s.sessionId}
-                  {s.phoneNumber ? ` · ${s.phoneNumber}` : ""}
-                  {s.status !== "connected" ? ` (${s.status})` : ""}
-                </option>
-              ))}
-            </select>
+          <div>
+            <div className="flex items-center justify-between">
+              <span className={label}>Send from {activeLanes.length > 1 ? `· ${activeLanes.length} accounts (rotating)` : ""}</span>
+              {connected.length > 1 ? (
+                <button
+                  type="button"
+                  className="text-[11px] text-indigo hover:underline"
+                  onClick={() => setLaneIds(allSelected ? [] : connected.map((s) => s.sessionId))}
+                >
+                  {allSelected ? "Clear all" : "Select all"}
+                </button>
+              ) : null}
+            </div>
             {connected.length === 0 ? (
-              <span className="mt-1 block text-[11px] normal-case tracking-normal text-danger">
-                No connected session — link a phone first.
-              </span>
-            ) : null}
-          </label>
+              <p className="mt-1 rounded-xl border border-line bg-night/30 px-3 py-2 text-[11px] text-danger">
+                No connected account — link a phone first.
+              </p>
+            ) : (
+              <div className="scroll-thin mt-1 max-h-36 space-y-0.5 overflow-auto rounded-xl border border-line bg-night/30 p-1">
+                {connected.map((s) => {
+                  const order = laneIds.indexOf(s.sessionId);
+                  return (
+                    <label key={s.sessionId} className="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 text-sm hover:bg-white/5">
+                      <input type="checkbox" checked={order > -1} onChange={() => toggleLane(s.sessionId)} className="accent-wa" />
+                      <span className="min-w-0 flex-1 truncate">
+                        {s.name || s.sessionId}
+                        {s.phoneNumber ? <span className="text-dim"> · {s.phoneNumber}</span> : null}
+                      </span>
+                      {s.proxy ? <span className="shrink-0 rounded-full border border-indigo/40 px-1.5 text-[9px] text-indigo" title={s.proxy}>proxy</span> : null}
+                      {order > -1 && activeLanes.length > 1 ? <span className="shrink-0 text-[10px] text-dim">#{order + 1}</span> : null}
+                    </label>
+                  );
+                })}
+              </div>
+            )}
+            <p className="mt-1 text-[11px] text-muted">
+              {activeLanes.length > 1
+                ? "Recipients are split round-robin across these accounts — each sends through its own proxy/IP."
+                : "Pick more than one account to spread the campaign across numbers."}
+            </p>
+          </div>
 
           <div>
             <div className="flex items-center justify-between">
@@ -379,8 +443,14 @@ export function BulkComposer() {
           {type === "image" ? (
             <>
               <label className={label}>
-                Image URL
-                <input value={imageUrl} onChange={(e) => setImageUrl(e.target.value)} placeholder="https://example.com/image.jpg" className={cn(field, "mt-1")} />
+                <span className="flex items-center justify-between">
+                  Image
+                  <UploadButton uploading={uploading} disabled={!session || session.status !== "connected"} onPick={pickFile} inputRef={uploadInput} accept="image/*" />
+                </span>
+                <input value={imageUrl} onChange={(e) => setImageUrl(e.target.value)} placeholder="https://example.com/image.jpg — or upload a file" className={cn(field, "mt-1")} />
+                {uploadedName.image && imageUrl.startsWith("/media/") ? (
+                  <span className="mt-1 block text-[11px] normal-case tracking-normal text-wa">Attached: {uploadedName.image}</span>
+                ) : null}
               </label>
               <label className={label}>
                 Caption <span className="normal-case tracking-normal text-dim">(optional)</span>
@@ -392,8 +462,14 @@ export function BulkComposer() {
           {type === "document" ? (
             <>
               <label className={label}>
-                Document URL
-                <input value={documentUrl} onChange={(e) => setDocumentUrl(e.target.value)} placeholder="https://example.com/brochure.pdf" className={cn(field, "mt-1")} />
+                <span className="flex items-center justify-between">
+                  Document
+                  <UploadButton uploading={uploading} disabled={!session || session.status !== "connected"} onPick={pickFile} inputRef={uploadInput} accept=".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.zip,image/*,video/*,audio/*" />
+                </span>
+                <input value={documentUrl} onChange={(e) => setDocumentUrl(e.target.value)} placeholder="https://example.com/brochure.pdf — or upload a file" className={cn(field, "mt-1")} />
+                {uploadedName.document && documentUrl.startsWith("/media/") ? (
+                  <span className="mt-1 block text-[11px] normal-case tracking-normal text-wa">Attached: {uploadedName.document}</span>
+                ) : null}
               </label>
               <div className="grid grid-cols-2 gap-2">
                 <label className={label}>
@@ -473,6 +549,45 @@ export function BulkComposer() {
         </div>
       </div>
     </div>
+  );
+}
+
+function UploadButton({
+  uploading,
+  disabled,
+  onPick,
+  inputRef,
+  accept,
+}: {
+  uploading: boolean;
+  disabled: boolean;
+  onPick: (file: File) => void;
+  inputRef: React.RefObject<HTMLInputElement | null>;
+  accept: string;
+}) {
+  return (
+    <>
+      <input
+        ref={inputRef}
+        type="file"
+        hidden
+        accept={accept}
+        onChange={(e) => {
+          const f = e.target.files?.[0];
+          if (f) onPick(f);
+          e.target.value = "";
+        }}
+      />
+      <button
+        type="button"
+        disabled={disabled || uploading}
+        title={disabled ? "Pick a connected session first" : "Upload from your computer"}
+        onClick={() => inputRef.current?.click()}
+        className="rounded-md border border-line bg-night/40 px-2 py-0.5 text-[11px] normal-case tracking-normal text-ink hover:border-indigo/50 disabled:opacity-50"
+      >
+        {uploading ? "Uploading…" : "📎 Upload file"}
+      </button>
+    </>
   );
 }
 
@@ -597,6 +712,11 @@ function JobCard({
           {job.cancelRequested && running ? "stopping" : job.status}
         </span>
         <span className="rounded-full border border-line px-2 py-0.5 text-[11px] text-muted">{TYPE_LABEL[job.type]}</span>
+        {job.sessionIds && job.sessionIds.length > 1 ? (
+          <span className="rounded-full border border-indigo/40 px-2 py-0.5 text-[11px] text-indigo" title={job.sessionIds.join(", ")}>
+            🔁 {job.sessionIds.length} accounts
+          </span>
+        ) : null}
         <span className="min-w-0 flex-1 truncate text-sm font-medium">{job.name || payloadPreview(job) || job.jobId}</span>
         <span className="text-[11px] text-dim">{fmtWhen(job.createdAt)}</span>
       </div>
@@ -616,6 +736,16 @@ function JobCard({
         {job.failed ? <span className="text-danger">{job.failed} failed</span> : null}
         {job.skipped ? <span>{job.skipped} skipped</span> : null}
         {job.error ? <span className="text-danger">· {job.error}</span> : null}
+        {job.perSession && Object.keys(job.perSession).length > 1 ? (
+          <span className="w-full basis-full pt-1 text-[10.5px] text-dim">
+            {Object.values(job.perSession).map((p, i) => (
+              <span key={i} className="mr-3 inline-block">
+                {p.name || p.phoneNumber || "account"}: <span className="text-wa">{p.sent}</span>
+                {p.failed ? <span className="text-danger">/{p.failed}✗</span> : null}
+              </span>
+            ))}
+          </span>
+        ) : null}
         <span className="ml-auto flex gap-3">
           <button type="button" className="hover:text-ink" onClick={onToggle}>
             {expanded ? "Hide details" : "Details"}

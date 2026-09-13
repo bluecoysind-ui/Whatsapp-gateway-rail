@@ -247,6 +247,36 @@ class WebSocketManager {
         this.emitToSession(sessionId, 'labels', { labels });
     }
 
+    // ==================== Session lifecycle (room + global) ====================
+    //
+    // These go to the session's room AND to every client, so a dashboard can
+    // follow accounts it has not subscribed to yet (e.g. one just created).
+
+    /**
+     * Emit every status transition: connecting, qr_ready, qr_expired,
+     * connected, disconnected, logged_out, deleted.
+     */
+    emitSessionStatus(sessionId, status, details = {}) {
+        this.emitToSession(sessionId, 'session.status', { status, ...details });
+        this.broadcast('session.status', { sessionId, status, ...details });
+    }
+
+    /** An account finished linking / came back online. */
+    emitSessionConnected(sessionId, details = {}) {
+        this.emitToSession(sessionId, 'session.connected', details);
+        this.broadcast('session.connected', { sessionId, ...details });
+    }
+
+    /**
+     * A previously connected account dropped — socket lost, phone unlinked,
+     * or deleted through the API. `loggedOut` says whether it can come back
+     * on its own; `willReconnect` whether the gateway is about to try.
+     */
+    emitSessionDisconnected(sessionId, details = {}) {
+        this.emitToSession(sessionId, 'session.disconnected', details);
+        this.broadcast('session.disconnected', { sessionId, ...details });
+    }
+
     /**
      * Emit session logged out
      */

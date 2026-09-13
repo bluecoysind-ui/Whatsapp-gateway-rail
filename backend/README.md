@@ -167,6 +167,10 @@ PROXY_CHECK_TIMEOUT_MS=15000
 # Bulk messaging limits
 BULK_MAX_RECIPIENTS=100
 BULK_RECONNECT_WAIT_MS=60000
+
+# Media
+UPLOAD_MAX_BYTES=67108864          # max upload size for /media/upload and /chats/send-media (64 MB)
+MEDIA_AUTOSAVE_MAX_BYTES=26214400  # incoming media above this is fetched on demand via /chats/media (25 MB)
 ```
 
 > **Note:** Personal chat IDs use `@c.us` format (e.g., `628123456789@c.us`). Group IDs use `@g.us` format. Phone numbers are automatically normalized (0 → 62).
@@ -773,9 +777,13 @@ Bulk messaging runs in the background and returns immediately with a job ID. You
 
 > **⚡ Background Processing**: All bulk endpoints return immediately with a `jobId`. Messages are sent one at a time in the background to avoid request timeouts.
 
+**Multiple sending accounts (rotation).** Pass `sessionIds` (an array) instead of a single `sessionId` and the recipients are spread **round-robin** across those accounts — account 1 gets recipient 1, account 2 gets recipient 2, and so on. Because each session carries its own [proxy](#per-session-proxy), consecutive messages leave through different IPs automatically. The job is owned by the first account (its history lives there); every recipient's `via` records which account sent it, and `perSession` tallies each one. A single `sessionId` still works and behaves as a one-account campaign.
+
 How a job behaves:
 
 - Recipients are trimmed and de-duplicated; max 100 per job (`BULK_MAX_RECIPIENTS`).
+- Only connected accounts become lanes; disconnected ones in `sessionIds` are reported in the response's `skippedSessions`. If none are connected the request is rejected with `400`.
+- If a lane drops mid-campaign it is skipped and the other lanes keep sending; the job only pauses/`interrupted`s when **every** lane is disconnected.
 - Between messages the sender waits `delayBetweenMessages` plus a random `0..delayJitter` ms — vary the pacing, WhatsApp flags bursts of identical messages.
 - If the session drops mid-job, the job pauses for up to 60s (`BULK_RECONNECT_WAIT_MS`) waiting for it to reconnect, then gives up as `interrupted`.
 - A job can be cancelled; the recipients not yet attempted are recorded as `skipped`.
@@ -793,6 +801,7 @@ POST /chats/send-bulk
   "recipients": ["628123456789", "628987654321", "628111222333"],
   "message": "Hello! This is a bulk message.",
   "name": "September promo",
+  "sessionIds": ["accountA", "accountB"],
   "delayBetweenMessages": 3000,
   "delayJitter": 2000,
   "typingTime": 0
@@ -801,7 +810,8 @@ POST /chats/send-bulk
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `sessionId` | string | Required. Session ID |
+| `sessionIds` | array | Accounts to send from; recipients are rotated round-robin across them. Use this **or** `sessionId`. |
+| `sessionId` | string | A single sending account (equivalent to `sessionIds: [sessionId]`) |
 | `recipients` | array | Required. Array of phone numbers or JIDs (max 100) |
 | `message` | string | Required. Text message to send |
 | `name` | string | Optional. Label shown in the dashboard |
@@ -1050,6 +1060,43 @@ POST /chats/messages
   "cursor": null
 }
 ```
+
+#### Get Message Media (download on demand)
+```http
+POST /chats/media
+```
+
+**Body:**
+```json
+{ "sessionId": "mysession", "chatId": "628123456789@c.us", "messageId": "3EB0B430A2B52B67D0" }
+```
+
+Returns `{ url, mimetype, filename, size }` where `url` is a `/media/...` path served by this server. Incoming media up to `MEDIA_AUTOSAVE_MAX_BYTES` is saved as it arrives (and already has `mediaUrl` in `/chats/messages`); larger files and messages from before the gateway was running are downloaded from WhatsApp on the first call. The dashboard's **Load** button on a message uses this.
+
+Files are stored as `public/media/<sessionId>/<chatId>/<messageId>.<ext>`; the original name is returned as `filename`.
+
+#### Upload a File
+```http
+POST /media/upload
+Content-Type: multipart/form-data
+```
+
+Fields: `sessionId` (send it **before** the file), `file`. Returns `{ url, filename, mimetype, size }`; the `/media/...` URL is accepted anywhere a media URL is — `send-image`, `send-video`, `send-document`, `send-audio` and the bulk endpoints — so a file can be uploaded once and sent many times. Max size `UPLOAD_MAX_BYTES` (64 MB).
+
+#### Send a File (upload + send)
+```http
+POST /chats/send-media
+Content-Type: multipart/form-data
+```
+
+Fields: `sessionId`, `chatId`, `file`, optional `caption`, `typingTime`, `replyTo`, `ptt` (voice note), `asDocument` (send an image/video as a file). The message kind follows the mimetype: `image/*` → image, `video/*` → video, `audio/*` → audio, else document. This is what the dashboard's 📎 button calls.
+
+#### Send Video
+```http
+POST /chats/send-video
+```
+
+**Body:** `{ "sessionId", "chatId", "videoUrl", "caption"?, "gifPlayback"?, "typingTime"?, "replyTo"? }`
 
 #### Get Chat Info
 ```http
@@ -1543,6 +1590,9 @@ socket.emit('unsubscribe', 'mysession');
 | `call` | Incoming call | `{ sessionId, call, timestamp }` |
 | `labels` | Labels updated (business) | `{ sessionId, labels, timestamp }` |
 | `logged.out` | Session logged out | `{ sessionId, message, timestamp }` |
+| `session.status` | Every status transition, **also broadcast to all clients** (no subscribe needed): connecting, qr_ready, qr_expired, connected, disconnected, logged_out, deleted | `{ sessionId, status, phoneNumber?, name?, reason?, timestamp }` |
+| `session.connected` | An account finished linking / came back online (room + broadcast) | `{ sessionId, phoneNumber, name, timestamp }` |
+| `session.disconnected` | A previously connected account went away (room + broadcast) | `{ sessionId, phoneNumber, name, reason, loggedOut, willReconnect, timestamp }` |
 | `bulk.progress` | A bulk job sent (or failed) one recipient | `{ sessionId, job, last, timestamp }` — `job` is the summary, `last` the recipient just attempted |
 | `bulk.completed` | A bulk job finished (`completed`, `cancelled` or `interrupted`) | `{ sessionId, job, timestamp }` |
 
@@ -1673,7 +1723,15 @@ All configured webhook endpoints will receive POST requests with this format:
 | `connection.update` | Connection status changed (connected, disconnected) |
 | `message` | New message received |
 | `message.sent` | Message sent confirmation |
+| `session.connected` | An account finished linking / came back online — `{ sessionId, phoneNumber, name, timestamp }` |
+| `session.disconnected` | A previously connected account went away — `{ sessionId, phoneNumber, name, reason, loggedOut, willReconnect, timestamp }`. `loggedOut: true` means the phone unlinked the device (it will not come back by itself); `willReconnect: true` means the gateway is retrying a dropped socket. |
 | `bulk.completed` | A bulk messaging job finished (payload: the job summary) |
+
+> **Extension point.** Both session events go through one plain function each in
+> [`src/services/whatsapp/sessionEvents.js`](src/services/whatsapp/sessionEvents.js)
+> (`onSessionConnected`, `onSessionDisconnected`). Today they log
+> `🔴 User <name> (<phone>) logged out` and forward to webhooks/WebSocket; add your
+> own API call there (marked `TODO(callback)`) to notify a CRM, billing, alerting, etc.
 
 Set `events: ["all"]` to receive all events, or specify individual events per webhook.
 

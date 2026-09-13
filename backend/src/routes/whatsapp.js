@@ -3,6 +3,58 @@ const router = express.Router();
 const whatsappManager = require('../services/whatsapp');
 const bulkJobManager = require('../services/whatsapp/BulkJobManager');
 const { parseProxyUrl, checkProxy } = require('../services/whatsapp/proxy');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+
+// ==================== FILE UPLOADS ====================
+//
+// Files land in public/media/<sessionId>/uploads/ and are served by the
+// existing /media static mount, so the returned URL works for the dashboard
+// and can be passed straight back into any send-* endpoint.
+
+const UPLOAD_MAX_BYTES = Number(process.env.UPLOAD_MAX_BYTES) || 64 * 1024 * 1024;
+
+const safeFilename = (name) => {
+    const base = path.basename(name || 'file').replace(/[^\w.\-() ]+/g, '_').slice(-120);
+    return base || 'file';
+};
+
+const uploadStorage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        const sessionId = req.body?.sessionId;
+        if (!sessionId || !/^[a-zA-Z0-9_-]+$/.test(sessionId)) {
+            return cb(new Error('Missing or invalid sessionId (send it before the file in the form)'));
+        }
+        const dir = path.join(process.cwd(), 'public', 'media', sessionId, 'uploads');
+        fs.mkdirSync(dir, { recursive: true });
+        cb(null, dir);
+    },
+    filename: (req, file, cb) => {
+        cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${safeFilename(file.originalname)}`);
+    }
+});
+
+const upload = multer({ storage: uploadStorage, limits: { fileSize: UPLOAD_MAX_BYTES } });
+
+/** Run a multer middleware and turn its errors into JSON 400s instead of a stack trace. */
+const uploadSingle = (field) => (req, res, next) => {
+    upload.single(field)(req, res, (error) => {
+        if (!error) return next();
+        const message = error.code === 'LIMIT_FILE_SIZE'
+            ? `File too large (max ${Math.round(UPLOAD_MAX_BYTES / 1024 / 1024)} MB)`
+            : error.message;
+        res.status(400).json({ success: false, message });
+    });
+};
+
+/** Describe an uploaded file for API responses (never the disk path). */
+const describeUpload = (req) => ({
+    url: `/media/${req.body.sessionId}/uploads/${req.file.filename}`,
+    filename: req.file.originalname,
+    mimetype: req.file.mimetype,
+    size: req.file.size
+});
 
 /**
  * Normalise a `proxy` field from a request body: undefined = untouched,
@@ -217,6 +269,36 @@ router.post('/proxy/test', async (req, res) => {
             success: result.ok,
             message: result.ok ? `Proxy reachable — egress IP ${result.ip}` : `Proxy check failed: ${result.error}`,
             data: result
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
+});
+
+// Upload a file for a session (multipart/form-data: sessionId, file).
+// Returns a /media/... URL usable in send-image / send-document / bulk sends.
+router.post('/media/upload', uploadSingle('file'), (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({
+                success: false,
+                message: 'Missing file (multipart field "file")'
+            });
+        }
+        if (!whatsappManager.getSession(req.body.sessionId)) {
+            fs.rm(req.file.path, { force: true }, () => {});
+            return res.status(404).json({
+                success: false,
+                message: 'Session not found'
+            });
+        }
+        res.json({
+            success: true,
+            message: 'File uploaded',
+            data: describeUpload(req)
         });
     } catch (error) {
         res.status(500).json({
@@ -502,6 +584,64 @@ router.post('/chats/send-document', checkSession, async (req, res) => {
     }
 });
 
+// Send video
+router.post('/chats/send-video', checkSession, async (req, res) => {
+    try {
+        const { chatId, videoUrl, caption = '', typingTime = 0, replyTo = null, gifPlayback = false } = req.body;
+
+        if (!chatId || !videoUrl) {
+            return res.status(400).json({
+                success: false,
+                message: 'Missing required fields: chatId, videoUrl'
+            });
+        }
+
+        const result = await req.session.sendVideo(chatId, videoUrl, caption, typingTime, replyTo, gifPlayback);
+        res.json(result);
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
+});
+
+// Send an uploaded file in one request (multipart/form-data: sessionId, chatId,
+// file, caption?, typingTime?, replyTo?, ptt?, asDocument?). The message kind
+// follows the file's mimetype: image / video / audio / document.
+router.post('/chats/send-media', uploadSingle('file'), checkSession, async (req, res) => {
+    try {
+        const { chatId, caption = '', typingTime = 0, replyTo = null, ptt, asDocument } = req.body;
+
+        if (!req.file) {
+            return res.status(400).json({
+                success: false,
+                message: 'Missing file (multipart field "file")'
+            });
+        }
+        if (!chatId) {
+            return res.status(400).json({
+                success: false,
+                message: 'Missing required field: chatId'
+            });
+        }
+
+        const result = await req.session.sendMedia(chatId, describeUpload(req), {
+            caption,
+            typingTime: Number(typingTime) || 0,
+            replyTo: replyTo || null,
+            ptt: ptt === true || ptt === 'true',
+            asDocument: asDocument === true || asDocument === 'true'
+        });
+        res.status(result.success ? 200 : 400).json(result);
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
+});
+
 // Send audio message (OGG format required)
 router.post('/chats/send-audio', checkSession, async (req, res) => {
     try {
@@ -659,12 +799,54 @@ const checkSessionExists = (req, res, next) => {
     next();
 };
 
+// Resolve the sending accounts for a bulk send. Accepts `sessionIds` (array,
+// for multi-account rotation) or a single `sessionId`; only connected accounts
+// become lanes, and accounts that could not be used are reported back.
+const resolveBulkLanes = (req, res, next) => {
+    const body = req.body || {};
+    let ids = Array.isArray(body.sessionIds) && body.sessionIds.length
+        ? body.sessionIds
+        : (body.sessionId ? [body.sessionId] : []);
+    ids = [...new Set(ids.filter((x) => typeof x === 'string' && x.trim()).map((x) => x.trim()))];
+
+    if (ids.length === 0) {
+        return res.status(400).json({
+            success: false,
+            message: 'Missing required field: sessionIds (array) or sessionId'
+        });
+    }
+
+    const lanes = [];
+    const notFound = [];
+    const notConnected = [];
+    for (const id of ids) {
+        const session = whatsappManager.getSession(id);
+        if (!session) notFound.push(id);
+        else if (session.connectionStatus !== 'connected') notConnected.push(id);
+        else lanes.push(session);
+    }
+
+    if (lanes.length === 0) {
+        const parts = [];
+        if (notFound.length) parts.push(`not found: ${notFound.join(', ')}`);
+        if (notConnected.length) parts.push(`not connected: ${notConnected.join(', ')}`);
+        return res.status(400).json({
+            success: false,
+            message: `No connected account to send from${parts.length ? ` (${parts.join('; ')})` : ''}`
+        });
+    }
+
+    req.lanes = lanes;
+    req.laneSkipped = { notFound, notConnected };
+    next();
+};
+
 // Shared handler: build the job from the request and answer with its id.
 const startBulkJob = (type, buildPayload) => (req, res) => {
     try {
         const { recipients, name, delayBetweenMessages, delayJitter, typingTime } = req.body;
 
-        const result = bulkJobManager.createJob(req.session, {
+        const result = bulkJobManager.createJob(req.lanes, {
             type,
             recipients,
             name,
@@ -679,12 +861,18 @@ const startBulkJob = (type, buildPayload) => (req, res) => {
             });
         }
 
+        const skipped = req.laneSkipped || {};
+        const skippedIds = [...(skipped.notFound || []), ...(skipped.notConnected || [])];
+
         res.json({
             success: true,
-            message: `Bulk ${type} job started. Check status with jobId.`,
+            message: `Bulk ${type} job started across ${result.job.sessionIds.length} account(s). Check status with jobId.`,
             data: {
                 jobId: result.job.jobId,
                 total: result.job.total,
+                sessionIds: result.job.sessionIds,
+                rotation: result.job.rotation,
+                skippedSessions: skippedIds.length ? skippedIds : undefined,
                 statusUrl: `/api/whatsapp/chats/bulk-status/${result.job.jobId}`
             }
         });
@@ -761,8 +949,9 @@ router.post('/chats/bulk-jobs/:jobId/cancel', (req, res) => {
     }
 });
 
-// Re-send a finished job to the recipients that did not receive it
-router.post('/chats/bulk-jobs/:jobId/retry', checkSession, (req, res) => {
+// Re-send a finished job to the recipients that did not receive it, across the
+// same accounts (whichever are still connected).
+router.post('/chats/bulk-jobs/:jobId/retry', checkSessionExists, (req, res) => {
     try {
         const source = bulkJobManager.getJob(req.params.jobId);
 
@@ -773,7 +962,8 @@ router.post('/chats/bulk-jobs/:jobId/retry', checkSession, (req, res) => {
             });
         }
 
-        if (source.sessionId !== req.session.sessionId) {
+        const laneIds = source.sessionIds || [source.sessionId];
+        if (!laneIds.includes(req.session.sessionId)) {
             return res.status(400).json({
                 success: false,
                 message: 'Job belongs to a different session'
@@ -795,7 +985,18 @@ router.post('/chats/bulk-jobs/:jobId/retry', checkSession, (req, res) => {
             });
         }
 
-        const result = bulkJobManager.createJob(req.session, {
+        // Reuse the accounts that are still connected; the owner leads the rotation.
+        const lanes = laneIds
+            .map((id) => whatsappManager.getSession(id))
+            .filter((sess) => sess && sess.connectionStatus === 'connected');
+        if (lanes.length === 0) {
+            return res.status(409).json({
+                success: false,
+                message: 'None of the campaign\'s accounts are connected'
+            });
+        }
+
+        const result = bulkJobManager.createJob(lanes, {
             type: source.type,
             recipients,
             name: source.name ? `${source.name} (retry)` : 'Retry',
@@ -812,10 +1013,11 @@ router.post('/chats/bulk-jobs/:jobId/retry', checkSession, (req, res) => {
 
         res.json({
             success: true,
-            message: `Retry job started for ${recipients.length} recipient(s).`,
+            message: `Retry job started for ${recipients.length} recipient(s) across ${lanes.length} account(s).`,
             data: {
                 jobId: result.job.jobId,
                 total: result.job.total,
+                sessionIds: result.job.sessionIds,
                 retryOf: source.jobId,
                 statusUrl: `/api/whatsapp/chats/bulk-status/${result.job.jobId}`
             }
@@ -831,21 +1033,21 @@ router.post('/chats/bulk-jobs/:jobId/retry', checkSession, (req, res) => {
 // Send bulk text message (Background)
 router.post(
     '/chats/send-bulk',
-    checkSession,
+    resolveBulkLanes,
     startBulkJob('text', ({ message }) => ({ message }))
 );
 
 // Send bulk image message (Background)
 router.post(
     '/chats/send-bulk-image',
-    checkSession,
+    resolveBulkLanes,
     startBulkJob('image', ({ imageUrl, caption }) => ({ imageUrl, caption }))
 );
 
 // Send bulk document message (Background)
 router.post(
     '/chats/send-bulk-document',
-    checkSession,
+    resolveBulkLanes,
     startBulkJob('document', ({ documentUrl, filename, mimetype, caption }) => ({
         documentUrl,
         filename,
@@ -853,6 +1055,29 @@ router.post(
         caption
     }))
 );
+
+// Get (downloading on first request) the media of a message in history.
+// Body: { sessionId, chatId, messageId }
+router.post('/chats/media', checkSessionExists, async (req, res) => {
+    try {
+        const { chatId, messageId } = req.body;
+
+        if (!chatId || !messageId) {
+            return res.status(400).json({
+                success: false,
+                message: 'Missing required fields: chatId, messageId'
+            });
+        }
+
+        const result = await req.session.getMessageMedia(chatId, messageId);
+        res.status(result.success ? 200 : 404).json(result);
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
+});
 
 // Send presence update (typing indicator)
 router.post('/chats/presence', checkSession, async (req, res) => {

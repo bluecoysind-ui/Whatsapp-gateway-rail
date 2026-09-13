@@ -8,9 +8,12 @@ const BaileysStore = require('./BaileysStore');
 const MessageFormatter = require('./MessageFormatter');
 const wsManager = require('../websocket/WebSocketManager');
 const { buildProxyAgents, redactProxyUrl } = require('./proxy');
+const sessionEvents = require('./sessionEvents');
 
 /** How long a QR pairing window stays open before the session is revoked (ms). */
 const QR_EXPIRY_MS = Number(process.env.QR_EXPIRY_MS) || 120_000;
+/** Incoming media above this size is not downloaded automatically (fetched on demand instead). */
+const MEDIA_AUTOSAVE_MAX_BYTES = Number(process.env.MEDIA_AUTOSAVE_MAX_BYTES) || 25 * 1024 * 1024;
 
 /**
  * WhatsApp Session Class
@@ -33,6 +36,9 @@ class WhatsAppSession {
         this.qrTimer = null;
         this.qrExpired = false;
         this.qrExpiresAt = null;
+        // messageId -> /media/... path for media we sent from a local file, applied
+        // when the echo of our own message lands in the store.
+        this._pendingMediaPaths = new Map();
         
         // Custom metadata and webhook
         this.metadata = options.metadata || {};
@@ -300,6 +306,7 @@ class WhatsAppSession {
         console.log(`⏰ [${this.sessionId}] QR login expired (${reason}) — session revoked. Reconnect to get a fresh QR.`);
 
         wsManager.emitConnectionStatus(this.sessionId, 'qr_expired', { reason });
+        wsManager.emitSessionStatus(this.sessionId, 'qr_expired', { reason });
         this._sendWebhook('connection.update', { status: 'qr_expired', reason });
 
         // Partial pairing creds are useless without a scan — drop them.
@@ -321,6 +328,7 @@ class WhatsAppSession {
 
                 // Emit QR code to WebSocket
                 wsManager.emitQRCode(this.sessionId, this.qrCode);
+                wsManager.emitSessionStatus(this.sessionId, 'qr_ready', { qrExpiresAt: this.qrExpiresAt });
 
                 // Start (or keep) the pairing countdown — no endless QR minting.
                 this._startQrExpiryTimer();
@@ -329,6 +337,7 @@ class WhatsAppSession {
             if (connection === 'close') {
                 const reason = lastDisconnect?.error?.message;
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
+                const wasConnected = this.connectionStatus === 'connected';
                 // QR pairing window over: either our timer fired, or Baileys ran
                 // out of QR refs ("QR refs attempts ended", statusCode timedOut)
                 // for a session that never finished pairing.
@@ -345,7 +354,7 @@ class WhatsAppSession {
                 }
 
                 const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-                this.connectionStatus = 'disconnected';
+                this.connectionStatus = shouldReconnect ? 'disconnected' : 'logged_out';
                 this.qrCode = null;
 
                 // Emit connection status to WebSocket
@@ -359,6 +368,24 @@ class WhatsAppSession {
                     status: 'disconnected',
                     reason,
                     shouldReconnect
+                });
+
+                // Explicit lifecycle event: only when an account that WAS online
+                // went away, so consumers can react to "this person disconnected".
+                if (wasConnected) {
+                    sessionEvents.onSessionDisconnected({
+                        sessionId: this.sessionId,
+                        phoneNumber: this.phoneNumber,
+                        name: this.name,
+                        reason: reason || null,
+                        loggedOut: !shouldReconnect,
+                        willReconnect: shouldReconnect
+                    }, { sendWebhook: (event, data) => this._sendWebhook(event, data) });
+                }
+                wsManager.emitSessionStatus(this.sessionId, this.connectionStatus, {
+                    reason: reason || null,
+                    phoneNumber: this.phoneNumber,
+                    name: this.name
                 });
 
                 if (shouldReconnect) {
@@ -403,12 +430,18 @@ class WhatsAppSession {
                     phoneNumber: this.phoneNumber,
                     name: this.name
                 });
+
+                // Explicit lifecycle event
+                const details = { sessionId: this.sessionId, phoneNumber: this.phoneNumber, name: this.name };
+                sessionEvents.onSessionConnected(details, { sendWebhook: (event, data) => this._sendWebhook(event, data) });
+                wsManager.emitSessionStatus(this.sessionId, 'connected', details);
             } else if (connection === 'connecting') {
                 console.log(`🔄 [${this.sessionId}] Connecting to WhatsApp...`);
                 this.connectionStatus = 'connecting';
-                
+
                 // Emit connection status to WebSocket
                 wsManager.emitConnectionStatus(this.sessionId, 'connecting');
+                wsManager.emitSessionStatus(this.sessionId, 'connecting');
             }
         });
 
@@ -431,9 +464,12 @@ class WhatsAppSession {
                     return;
                 }
                 
+                // Media we sent from a local file: point the stored echo at that file.
+                this._applyPendingMediaPath(message);
+
                 if (!message.key.fromMe && m.type === 'notify') {
                     console.log(`📩 [${this.sessionId}] New message from:`, message.key.remoteJid);
-                    
+
                     // Auto-save media if present
                     await this._autoSaveMedia(message);
                     
@@ -878,7 +914,7 @@ class WhatsAppSession {
             await this._simulateTyping(jid, typingTime);
             
             const messageContent = {
-                image: { url: imageUrl },
+                image: { url: this._resolveMediaUrl(imageUrl) },
                 caption: caption
             };
             const messageOptions = {};
@@ -901,6 +937,7 @@ class WhatsAppSession {
             }
             
             const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
+            this._rememberOutgoingMedia(jid, result.key.id, imageUrl);
 
             return {
                 success: true,
@@ -928,7 +965,7 @@ class WhatsAppSession {
             await this._simulateTyping(jid, typingTime);
             
             const messageContent = {
-                document: { url: documentUrl },
+                document: { url: this._resolveMediaUrl(documentUrl) },
                 fileName: filename,
                 mimetype: mimetype,
                 caption: caption || undefined
@@ -953,6 +990,7 @@ class WhatsAppSession {
             }
             
             const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
+            this._rememberOutgoingMedia(jid, result.key.id, documentUrl);
 
             return {
                 success: true,
@@ -976,6 +1014,210 @@ class WhatsAppSession {
      * @param {number} typingTime - Typing simulation time in ms
      * @param {string} replyTo - Message ID to reply to
      */
+    async sendVideo(chatId, videoUrl, caption = '', typingTime = 0, replyTo = null, gifPlayback = false) {
+        try {
+            if (!this.socket || this.connectionStatus !== 'connected') {
+                return { success: false, message: 'Session not connected' };
+            }
+
+            const jid = this.formatChatId(chatId);
+            await this._simulateTyping(jid, typingTime);
+
+            const messageContent = {
+                video: { url: this._resolveMediaUrl(videoUrl) },
+                caption,
+                gifPlayback: Boolean(gifPlayback)
+            };
+            const messageOptions = {};
+            if (replyTo) {
+                messageOptions.quoted = this.store?.getMessage(jid, replyTo) || {
+                    key: { remoteJid: jid, id: replyTo, fromMe: false },
+                    message: { conversation: '' }
+                };
+            }
+
+            const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
+            this._rememberOutgoingMedia(jid, result.key.id, videoUrl);
+
+            return {
+                success: true,
+                message: 'Video sent successfully',
+                data: {
+                    messageId: result.key.id,
+                    chatId: jid,
+                    timestamp: new Date().toISOString()
+                }
+            };
+        } catch (error) {
+            return { success: false, message: error.message };
+        }
+    }
+
+    /**
+     * Send a file that was uploaded to this server. The kind of WhatsApp
+     * message is picked from the mimetype: image / video / audio / document.
+     * @param {string} chatId
+     * @param {Object} file - { url: '/media/...', mimetype, filename, size }
+     * @param {Object} [opts] - { caption, typingTime, replyTo, ptt, asDocument }
+     */
+    async sendMedia(chatId, file, opts = {}) {
+        try {
+            if (!this.socket || this.connectionStatus !== 'connected') {
+                return { success: false, message: 'Session not connected' };
+            }
+            if (!file || !file.url) {
+                return { success: false, message: 'No file to send' };
+            }
+
+            const { caption = '', typingTime = 0, replyTo = null, ptt = false, asDocument = false } = opts;
+            const mimetype = (file.mimetype || 'application/octet-stream').toLowerCase();
+            const source = this._resolveMediaUrl(file.url);
+            const jid = this.formatChatId(chatId);
+            await this._simulateTyping(jid, typingTime);
+
+            let kind;
+            let messageContent;
+            if (!asDocument && mimetype.startsWith('image/') && mimetype !== 'image/webp') {
+                kind = 'image';
+                messageContent = { image: { url: source }, caption };
+            } else if (!asDocument && mimetype.startsWith('video/')) {
+                kind = 'video';
+                messageContent = { video: { url: source }, caption };
+            } else if (!asDocument && mimetype.startsWith('audio/')) {
+                kind = ptt ? 'ptt' : 'audio';
+                messageContent = { audio: { url: source }, mimetype, ptt: Boolean(ptt) };
+            } else {
+                kind = 'document';
+                messageContent = {
+                    document: { url: source },
+                    mimetype,
+                    fileName: file.filename || path.basename(source),
+                    caption
+                };
+            }
+
+            const messageOptions = {};
+            if (replyTo) {
+                messageOptions.quoted = this.store?.getMessage(jid, replyTo) || {
+                    key: { remoteJid: jid, id: replyTo, fromMe: false },
+                    message: { conversation: '' }
+                };
+            }
+
+            const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
+            this._rememberOutgoingMedia(jid, result.key.id, file.url);
+
+            return {
+                success: true,
+                message: `${kind} sent successfully`,
+                data: {
+                    messageId: result.key.id,
+                    chatId: jid,
+                    type: kind,
+                    mediaUrl: file.url,
+                    mimetype,
+                    filename: file.filename || null,
+                    caption: caption || null,
+                    timestamp: new Date().toISOString()
+                }
+            };
+        } catch (error) {
+            return { success: false, message: error.message };
+        }
+    }
+
+    /**
+     * Make sure a message's media is on disk and return its URL — downloads
+     * it from WhatsApp on first request (history messages, big videos).
+     */
+    async getMessageMedia(chatId, messageId) {
+        try {
+            if (!this.store) {
+                return { success: false, message: 'Session store not ready' };
+            }
+            const jid = this.formatChatId(chatId);
+            const msg = this.store.getMessage(jid, messageId)
+                || this.store.getMessage(chatId, messageId);
+            if (!msg) {
+                return { success: false, message: 'Message not found in this session\'s history' };
+            }
+
+            const contentType = msg.message ? getContentType(msg.message) : null;
+            const mediaContent = contentType ? msg.message[contentType] : null;
+            if (!mediaContent || !['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(contentType)) {
+                return { success: false, message: 'Message has no media' };
+            }
+
+            let relativePath = msg._mediaPath || null;
+            const onDisk = relativePath && fs.existsSync(msg._mediaLocalPath || path.join(process.cwd(), 'public', relativePath));
+            if (!onDisk) {
+                if (!this.socket || this.connectionStatus !== 'connected') {
+                    return { success: false, message: 'Session not connected — cannot download media' };
+                }
+                relativePath = await this._autoSaveMedia(msg, { force: true });
+                if (!relativePath) {
+                    return { success: false, message: 'Media could not be downloaded (it may have expired on WhatsApp)' };
+                }
+            }
+
+            return {
+                success: true,
+                data: {
+                    messageId,
+                    chatId: jid,
+                    url: relativePath,
+                    mimetype: mediaContent.mimetype || this._getMimetype(contentType),
+                    filename: mediaContent.fileName || path.basename(relativePath),
+                    size: Number(mediaContent.fileLength) || null
+                }
+            };
+        } catch (error) {
+            return { success: false, message: error.message };
+        }
+    }
+
+    /** `/media/...` (our static mount) -> absolute file path Baileys can stream; anything else untouched. */
+    _resolveMediaUrl(url) {
+        if (typeof url === 'string' && url.startsWith('/media/')) {
+            const clean = decodeURIComponent(url.split('?')[0]);
+            const abs = path.join(process.cwd(), 'public', clean);
+            // Never let a crafted URL escape public/media.
+            const root = path.join(process.cwd(), 'public', 'media');
+            if (!abs.startsWith(root)) throw new Error('Invalid media path');
+            return abs;
+        }
+        return url;
+    }
+
+    /** Remember that an outgoing message's media lives at a local /media/ URL. */
+    _rememberOutgoingMedia(jid, messageId, url) {
+        if (!messageId || typeof url !== 'string' || !url.startsWith('/media/')) return;
+        const clean = url.split('?')[0];
+        const localPath = path.join(process.cwd(), 'public', decodeURIComponent(clean));
+        const stored = this.store?.getMessage(jid, messageId);
+        if (stored) {
+            stored._mediaPath = clean;
+            stored._mediaLocalPath = localPath;
+        } else {
+            this._pendingMediaPaths.set(messageId, { relativePath: clean, localPath });
+        }
+        if (this.store) this.store.registerMediaFile(messageId, localPath);
+    }
+
+    _applyPendingMediaPath(message) {
+        const id = message?.key?.id;
+        if (!id || !this._pendingMediaPaths.has(id)) return;
+        const { relativePath, localPath } = this._pendingMediaPaths.get(id);
+        this._pendingMediaPaths.delete(id);
+        message._mediaPath = relativePath;
+        message._mediaLocalPath = localPath;
+        const stored = this.store?.getMessage(message.key.remoteJid, id);
+        if (stored && stored !== message) {
+            stored._mediaPath = relativePath;
+            stored._mediaLocalPath = localPath;
+        }
+    }
+
     async sendAudio(chatId, audioUrl, ptt = false, typingTime = 0, replyTo = null) {
         try {
             if (!this.socket || this.connectionStatus !== 'connected') {
@@ -1001,7 +1243,7 @@ class WhatsAppSession {
             }
             
             const messageContent = {
-                audio: { url: audioUrl },
+                audio: { url: this._resolveMediaUrl(audioUrl) },
                 ptt: ptt, // true = voice note, false = audio file
                 mimetype: 'audio/ogg; codecs=opus'
             };
@@ -1985,17 +2227,25 @@ class WhatsAppSession {
     /**
      * Auto-save media when message received
      */
-    async _autoSaveMedia(message) {
+    async _autoSaveMedia(message, { force = false } = {}) {
         try {
             if (!message.message) return null;
 
             const contentType = getContentType(message.message);
-            const mediaTypes = ['imageMessage', 'audioMessage', 'documentMessage', 'stickerMessage']; // 'videoMessage' can be added if needed
-            
+            const mediaTypes = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'];
+
             if (!contentType || !mediaTypes.includes(contentType)) return null;
 
             const mediaContent = message.message[contentType];
             if (!mediaContent) return null;
+
+            // Big files (typically videos) are fetched on demand via getMessageMedia
+            // instead of on every incoming message.
+            const size = Number(mediaContent.fileLength) || 0;
+            if (!force && size > MEDIA_AUTOSAVE_MAX_BYTES) {
+                console.log(`⏭️ [${this.sessionId}] Skipping auto-save of ${contentType} (${Math.round(size / 1e6)} MB) — load on demand`);
+                return null;
+            }
 
             // Download media
             const buffer = await downloadMediaMessage(
@@ -2013,10 +2263,11 @@ class WhatsAppSession {
                 fs.mkdirSync(mediaDir, { recursive: true });
             }
 
-            // Generate filename
+            // Filename: message id + extension, so two "invoice.pdf"s never collide.
+            // The original name is still exposed by the formatter as `filename`.
             const mimetype = mediaContent.mimetype || this._getMimetype(contentType);
             const ext = this._getExtFromMimetype(mimetype);
-            const filename = mediaContent.fileName || `${message.key.id}.${ext}`;
+            const filename = `${message.key.id}.${ext}`;
             const filePath = path.join(mediaDir, filename);
 
             // Save file
@@ -2032,7 +2283,10 @@ class WhatsAppSession {
             
             console.log(`💾 [${this.sessionId}] Media saved: ${relativePath}`);
 
-            // Update message in store with media path
+            // Update message in store with media path (and the object we were handed,
+            // which may be the store's own instance or a fresh copy)
+            message._mediaPath = relativePath;
+            message._mediaLocalPath = filePath;
             if (this.store) {
                 const chatMessages = this.store.messages.get(message.key.remoteJid);
                 if (chatMessages && chatMessages.has(message.key.id)) {

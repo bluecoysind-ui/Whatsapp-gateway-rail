@@ -12,6 +12,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as DashboardRouteImport } from './routes/dashboard'
 import { Route as ApiHealthRouteImport } from './routes/api/health'
+import { Route as MediaSplatRouteImport } from './routes/media/$'
 import { Route as ApiDashboardLoginRouteImport } from './routes/api/dashboard/login'
 import { Route as ApiWebsocketStatsRouteImport } from './routes/api/websocket/stats'
 import { Route as ApiWhatsappSplatRouteImport } from './routes/api/whatsapp/$'
@@ -29,6 +30,11 @@ const DashboardRoute = DashboardRouteImport.update({
 const ApiHealthRoute = ApiHealthRouteImport.update({
   id: '/api/health',
   path: '/api/health',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const MediaSplatRoute = MediaSplatRouteImport.update({
+  id: '/media/$',
+  path: '/media/$',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ApiDashboardLoginRoute = ApiDashboardLoginRouteImport.update({
@@ -51,6 +57,7 @@ export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/dashboard': typeof DashboardRoute
   '/api/health': typeof ApiHealthRoute
+  '/media/$': typeof MediaSplatRoute
   '/api/dashboard/login': typeof ApiDashboardLoginRoute
   '/api/websocket/stats': typeof ApiWebsocketStatsRoute
   '/api/whatsapp/$': typeof ApiWhatsappSplatRoute
@@ -59,6 +66,7 @@ export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/dashboard': typeof DashboardRoute
   '/api/health': typeof ApiHealthRoute
+  '/media/$': typeof MediaSplatRoute
   '/api/dashboard/login': typeof ApiDashboardLoginRoute
   '/api/websocket/stats': typeof ApiWebsocketStatsRoute
   '/api/whatsapp/$': typeof ApiWhatsappSplatRoute
@@ -68,6 +76,7 @@ export interface FileRoutesById {
   '/': typeof IndexRoute
   '/dashboard': typeof DashboardRoute
   '/api/health': typeof ApiHealthRoute
+  '/media/$': typeof MediaSplatRoute
   '/api/dashboard/login': typeof ApiDashboardLoginRoute
   '/api/websocket/stats': typeof ApiWebsocketStatsRoute
   '/api/whatsapp/$': typeof ApiWhatsappSplatRoute
@@ -78,6 +87,7 @@ export interface FileRouteTypes {
     | '/'
     | '/dashboard'
     | '/api/health'
+    | '/media/$'
     | '/api/dashboard/login'
     | '/api/websocket/stats'
     | '/api/whatsapp/$'
@@ -86,6 +96,7 @@ export interface FileRouteTypes {
     | '/'
     | '/dashboard'
     | '/api/health'
+    | '/media/$'
     | '/api/dashboard/login'
     | '/api/websocket/stats'
     | '/api/whatsapp/$'
@@ -94,6 +105,7 @@ export interface FileRouteTypes {
     | '/'
     | '/dashboard'
     | '/api/health'
+    | '/media/$'
     | '/api/dashboard/login'
     | '/api/websocket/stats'
     | '/api/whatsapp/$'
@@ -103,6 +115,7 @@ export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   DashboardRoute: typeof DashboardRoute
   ApiHealthRoute: typeof ApiHealthRoute
+  MediaSplatRoute: typeof MediaSplatRoute
   ApiDashboardLoginRoute: typeof ApiDashboardLoginRoute
   ApiWebsocketStatsRoute: typeof ApiWebsocketStatsRoute
   ApiWhatsappSplatRoute: typeof ApiWhatsappSplatRoute
@@ -129,6 +142,13 @@ declare module '@tanstack/react-router' {
       path: '/api/health'
       fullPath: '/api/health'
       preLoaderRoute: typeof ApiHealthRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/media/$': {
+      id: '/media/$'
+      path: '/media/$'
+      fullPath: '/media/$'
+      preLoaderRoute: typeof MediaSplatRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/api/dashboard/login': {
@@ -159,6 +179,7 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   DashboardRoute: DashboardRoute,
   ApiHealthRoute: ApiHealthRoute,
+  MediaSplatRoute: MediaSplatRoute,
   ApiDashboardLoginRoute: ApiDashboardLoginRoute,
   ApiWebsocketStatsRoute: ApiWebsocketStatsRoute,
   ApiWhatsappSplatRoute: ApiWhatsappSplatRoute,

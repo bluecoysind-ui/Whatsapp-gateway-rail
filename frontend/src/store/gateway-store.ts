@@ -1,10 +1,11 @@
 import { create } from "zustand";
-import type { Bubble, ChatPreview } from "@/lib/gateway-types";
+import type { Bubble, BubbleMedia, BubbleMediaType, ChatPreview } from "@/lib/gateway-types";
 import {
   addWebhook as apiAddWebhook,
   cancelBulkJob,
   connectSession,
   deleteSession as apiDeleteSession,
+  fetchMessageMedia,
   getQr,
   listBulkJobs,
   listChats,
@@ -14,6 +15,7 @@ import {
   loginDashboard,
   removeWebhook as apiRemoveWebhook,
   retryBulkJob,
+  sendMediaFile,
   sendRawApi,
   sendText,
   startBulkJob,
@@ -26,6 +28,14 @@ import {
   type GatewaySession,
   type StartBulkInput,
 } from "@/lib/gateway-client";
+
+/** Page sizes for the chat list and a conversation. */
+const CHATS_PAGE = 30;
+const MESSAGES_PAGE = 40;
+/** How often the dashboard re-reads session status (there is no push channel). */
+const SESSION_REFRESH_MS = 10_000;
+/** How often the open conversation / chat list are refreshed while the inbox is on screen. */
+const INBOX_REFRESH_MS = 8_000;
 
 /** WhatsApp timestamps are seconds; the UI wants a short local clock. */
 function clockFrom(ts: number | undefined): string {
@@ -48,6 +58,7 @@ function toChatPreview(c: GatewayChat): ChatPreview {
     name,
     preview: c.lastMessage ?? "",
     time: clockFrom(c.lastMessageTimestamp),
+    lastAt: c.lastMessageTimestamp,
     unread: c.unreadCount ?? 0,
     kind: c.isGroup ? "group" : "dm",
     avatar: c.profilePicture ? "photo" : "initials",
@@ -57,28 +68,85 @@ function toChatPreview(c: GatewayChat): ChatPreview {
   };
 }
 
-/** Backend message -> chat bubble. Media has no text, so label it by type.
- *  Reactions arrive as an object ({ emoji, targetMessageId }) — never render it raw. */
+const MEDIA_TYPES = new Set<string>(["image", "video", "audio", "ptt", "document", "sticker"]);
+
+/** Short chat-list line for a message, mirroring the backend's preview labels. */
+function previewOf(m: GatewayMessage): string {
+  if (typeof m.content === "string" && m.content) return m.content;
+  switch (m.type) {
+    case "image":
+      return m.caption || "📷 Photo";
+    case "video":
+      return m.caption || "🎥 Video";
+    case "ptt":
+      return "🎤 Voice message";
+    case "audio":
+      return "🎵 Audio";
+    case "document":
+      return `📄 ${m.filename || "Document"}`;
+    case "sticker":
+      return "🏷️ Sticker";
+    default:
+      return `[${m.type}]`;
+  }
+}
+
+/**
+ * Backend message -> chat bubble. Media keeps its type/url so the conversation
+ * can render it (or offer to fetch it); structured content (location, contact,
+ * poll, reaction) is summarised — never rendered raw.
+ */
 function toBubble(m: GatewayMessage): Bubble {
   const content = m.content;
-  const text =
-    typeof content === "string" && content
-      ? content
-      : content && typeof content === "object"
-        ? `${content.emoji ?? "👍"} reacted to a message`
-        : (m.caption ?? `[${m.type}]`);
+  const isMedia = MEDIA_TYPES.has(m.type);
+  let text: string;
+  if (typeof content === "string" && content) text = content;
+  else if (content && typeof content === "object") {
+    const c = content as Record<string, unknown>;
+    if (m.type === "reaction") text = `${(c.emoji as string) ?? "👍"} reacted to a message`;
+    else if (m.type === "location") text = `📍 ${(c.name as string) || (c.address as string) || `${c.latitude}, ${c.longitude}`}`;
+    else if (m.type === "contact") text = `👤 ${(c.displayName as string) || "Contact"}`;
+    else if (m.type === "poll") text = `📊 ${(c.question as string) || "Poll"}`;
+    else text = `[${m.type}]`;
+  } else if (isMedia) text = m.caption ?? "";
+  else text = m.caption ?? `[${m.type}]`;
+
+  const media: BubbleMedia | undefined = isMedia
+    ? {
+        type: m.type as BubbleMediaType,
+        url: m.mediaUrl ?? null,
+        mimetype: m.mimetype ?? null,
+        filename: m.filename ?? null,
+      }
+    : undefined;
+
   return {
     id: m.id,
     kind: "text",
     from: m.fromMe ? "me" : "them",
     text,
     time: clockFrom(m.timestamp),
+    sender: m.isGroup && !m.fromMe ? m.senderName || m.senderPhone || null : null,
+    media,
   };
+}
+
+/** Which WhatsApp message kind a local file becomes (mirrors the backend's mimetype rule). */
+export function mediaTypeForFile(file: File, asDocument = false): BubbleMediaType {
+  const mime = file.type.toLowerCase();
+  if (asDocument) return "document";
+  if (mime.startsWith("image/") && mime !== "image/webp") return "image";
+  if (mime.startsWith("video/")) return "video";
+  if (mime.startsWith("audio/")) return "audio";
+  return "document";
 }
 
 type NavId = "chats" | "contacts" | "groups" | "broadcast" | "tools" | "settings";
 type Filter = "all" | "unread" | "groups";
 type Overlay = null | "qr" | "create-session" | "webhooks" | "proxy" | "bulk" | "templates" | "search";
+
+/** Paging state of one loaded conversation. */
+type ThreadMeta = { cursor: string | null; hasMore: boolean; loading: boolean };
 
 type State = {
   live: boolean;
@@ -89,8 +157,12 @@ type State = {
   sessions: GatewaySession[];
   events: GatewayEvent[];
   chats: ChatPreview[];
+  chatsHasMore: boolean;
+  chatsLoading: boolean;
   threads: Record<string, Bubble[]>;
+  threadMeta: Record<string, ThreadMeta>;
   activeChatId: string;
+  /** Account the inbox shows. Every chat/message call goes through this session. */
   activeAccountId: string;
   nav: NavId;
   filter: Filter;
@@ -111,8 +183,13 @@ type State = {
   contactTab: "info" | "media" | "files" | "links";
   mobilePane: "list" | "chat" | "profile";
   init: () => Promise<void>;
+  refreshSessions: () => Promise<void>;
   loadChats: () => Promise<void>;
-  loadMessages: (chatId: string) => Promise<void>;
+  loadMoreChats: () => Promise<void>;
+  loadMessages: (chatId: string, opts?: { force?: boolean }) => Promise<void>;
+  loadOlderMessages: (chatId: string) => Promise<void>;
+  /** Ask the gateway for a message's attachment (downloads from WhatsApp if needed). */
+  loadMedia: (chatId: string, messageId: string) => Promise<string | null>;
   setNav: (id: NavId) => void;
   setFilter: (f: Filter) => void;
   setQuery: (q: string) => void;
@@ -120,6 +197,7 @@ type State = {
   selectAccount: (id: string) => void;
   setComposer: (v: string) => void;
   sendComposer: () => Promise<void>;
+  sendAttachment: (file: File, caption: string, asDocument?: boolean) => Promise<boolean>;
   openOverlay: (o: Overlay, extra?: string) => void;
   closeOverlay: () => void;
   createSession: (id: string, webhook?: string, proxy?: string) => Promise<void>;
@@ -127,7 +205,6 @@ type State = {
   setProxy: (sessionId: string, proxy: string | null) => Promise<boolean>;
   /** Fetch the egress IP through a proxy URL without saving it. */
   testProxy: (proxy: string) => Promise<{ ok: boolean; message: string; ip?: string; latencyMs?: number }>;
-  refreshSessions: () => Promise<void>;
   reconnect: (id: string) => Promise<void>;
   removeSession: (id: string) => Promise<void>;
   refreshQr: (id: string) => Promise<void>;
@@ -136,7 +213,7 @@ type State = {
   removeHook: (url: string) => Promise<void>;
   setBulkSession: (id: string) => void;
   loadBulkJobs: () => Promise<void>;
-  startBulk: (input: Omit<StartBulkInput, "sessionId"> & { sessionId?: string }) => Promise<string | null>;
+  startBulk: (input: Omit<StartBulkInput, "sessionIds"> & { sessionIds?: string[] }) => Promise<string | null>;
   cancelBulk: (jobId: string) => Promise<void>;
   retryBulk: (jobId: string) => Promise<void>;
   applyTemplate: (body: string) => void;
@@ -162,6 +239,10 @@ let qrWatchTimer: ReturnType<typeof setInterval> | null = null;
 /** Poll interval that refreshes campaign progress while any job is still sending. */
 let bulkWatchTimer: ReturnType<typeof setInterval> | null = null;
 
+/** Background timers: session status, and the open inbox. Started once by init(). */
+let sessionRefreshTimer: ReturnType<typeof setInterval> | null = null;
+let inboxRefreshTimer: ReturnType<typeof setInterval> | null = null;
+
 /**
  * Which session a campaign should go out from: the account picked in the rail
  * if it can send, else the first connected one, else whatever exists.
@@ -170,6 +251,37 @@ export function pickBulkSession(sessions: GatewaySession[], preferred: string): 
   const chosen = sessions.find((s) => s.sessionId === preferred);
   if (chosen?.status === "connected") return chosen;
   return sessions.find((s) => s.status === "connected") ?? chosen ?? sessions[0];
+}
+
+/** The account the inbox is showing — the one picked in the rail, else the first connected one. */
+export function activeSession(s: Pick<State, "sessions" | "activeAccountId">): GatewaySession | undefined {
+  return s.sessions.find((x) => x.sessionId === s.activeAccountId) ?? s.sessions.find((x) => x.status === "connected");
+}
+
+/** Replace an optimistic bubble (or apply a patch) inside one thread. */
+function patchBubble(threads: Record<string, Bubble[]>, chatId: string, id: string, patch: (b: Bubble) => Bubble | null) {
+  const thread = threads[chatId] ?? [];
+  const next: Bubble[] = [];
+  for (const b of thread) {
+    if (b.id !== id) {
+      next.push(b);
+      continue;
+    }
+    const replaced = patch(b);
+    if (replaced) next.push(replaced);
+  }
+  return { ...threads, [chatId]: next };
+}
+
+/** Human line for the explicit lifecycle events the gateway emits. */
+function describeStatusChange(before: GatewaySession | undefined, after: GatewaySession): string | null {
+  if (!before || before.status === after.status) return null;
+  const who = after.name || after.phoneNumber || after.sessionId;
+  if (after.status === "connected") return `${who} connected`;
+  if (before.status === "connected") {
+    return after.status === "logged_out" ? `${who} logged out` : `${who} disconnected (${after.status})`;
+  }
+  return `${after.sessionId}: ${before.status} → ${after.status}`;
 }
 
 export const useGateway = create<State>((set, get) => ({
@@ -181,7 +293,10 @@ export const useGateway = create<State>((set, get) => ({
   sessions: [],
   events: [],
   chats: [],
+  chatsHasMore: false,
+  chatsLoading: false,
   threads: {},
+  threadMeta: {},
   activeChatId: "",
   activeAccountId: "",
   nav: "chats",
@@ -205,7 +320,14 @@ export const useGateway = create<State>((set, get) => ({
     try {
       const result = await listSessions();
       if (result.success && Array.isArray(result.data)) {
-        set({ live: true, sessions: result.data, wsConnected: true });
+        const sessions = result.data;
+        const current = get().activeAccountId;
+        const active =
+          sessions.find((s) => s.sessionId === current && s.status === "connected") ??
+          sessions.find((s) => s.status === "connected") ??
+          sessions.find((s) => s.sessionId === current) ??
+          sessions[0];
+        set({ live: true, sessions, wsConnected: true, activeAccountId: active?.sessionId ?? "" });
         get().pushEvent("connection", "Connected to live gateway");
         await get().loadChats();
       } else {
@@ -223,55 +345,207 @@ export const useGateway = create<State>((set, get) => ({
     } catch {
       set({ wsClients: 1 });
     }
+
+    // Plain polling keeps the rail and the open inbox current — no push channel needed.
+    if (!sessionRefreshTimer) {
+      sessionRefreshTimer = setInterval(() => void get().refreshSessions(), SESSION_REFRESH_MS);
+    }
+    if (!inboxRefreshTimer) {
+      inboxRefreshTimer = setInterval(() => {
+        const { nav, live, activeChatId, overlay } = get();
+        if (!live || nav !== "chats" || overlay) return;
+        void get().loadChats();
+        if (activeChatId) void get().loadMessages(activeChatId, { force: true });
+      }, INBOX_REFRESH_MS);
+    }
   },
 
   /**
-   * Load the account's conversations. Only a *connected* session has history,
-   * so anything else leaves the list empty and states the reason — the panes
-   * render an explicit empty state rather than pretending to hold data.
+   * Re-read the session list. Status changes are announced in the event log
+   * (that is where "X disconnected" shows up), and an account that just came
+   * online while selected gets its chats loaded without a page refresh.
+   */
+  refreshSessions: async () => {
+    if (!get().live) return;
+    let result: Awaited<ReturnType<typeof listSessions>>;
+    try {
+      result = await listSessions();
+    } catch {
+      return; // transient; the next tick retries
+    }
+    if (!result.success || !Array.isArray(result.data)) return;
+    const before = get().sessions;
+    const sessions = result.data;
+    for (const s of sessions) {
+      const line = describeStatusChange(
+        before.find((b) => b.sessionId === s.sessionId),
+        s,
+      );
+      if (line) get().pushEvent("connection", line);
+    }
+    const activeId = get().activeAccountId;
+    const activeBefore = before.find((s) => s.sessionId === activeId);
+    const activeAfter = sessions.find((s) => s.sessionId === activeId);
+    const fallback = sessions.find((s) => s.status === "connected") ?? sessions[0];
+    const nextActive = activeAfter ? activeId : (fallback?.sessionId ?? "");
+    set({ sessions, activeAccountId: nextActive });
+    if (nextActive !== activeId) {
+      await get().loadChats();
+    } else if (activeAfter?.status === "connected" && activeBefore?.status !== "connected") {
+      await get().loadChats();
+    }
+  },
+
+  /**
+   * Load the active account's conversations (first page). Only a *connected*
+   * session has history, so anything else leaves the list empty and states
+   * the reason — the panes render an explicit empty state rather than
+   * pretending to hold data.
    */
   loadChats: async () => {
-    const session = get().sessions.find((s) => s.status === "connected");
-    if (!session) {
-      set({ chats: [], threads: {}, activeChatId: "" });
-      get().pushEvent("connection", "No connected session — scan the QR to load chats.");
+    const session = activeSession(get());
+    if (!session || session.status !== "connected") {
+      set({ chats: [], chatsHasMore: false, threads: {}, threadMeta: {}, activeChatId: "" });
+      if (session) get().pushEvent("connection", `${session.name || session.sessionId} is ${session.status} — no chats to show.`);
+      else get().pushEvent("connection", "No connected session — scan the QR to load chats.");
       return;
     }
+    set({ chatsLoading: true });
     try {
-      const result = await listChats(session.sessionId);
+      const result = await listChats(session.sessionId, CHATS_PAGE, 0);
+      // The account changed while we were waiting — drop this response.
+      if (get().activeAccountId !== session.sessionId) return;
       if (!result.success || !result.data) {
         get().pushEvent("error", result.message ?? "Could not load chats");
         return;
       }
-      const chats = result.data.chats.map(toChatPreview);
-      if (chats.length === 0) {
-        set({ chats: [], threads: {}, activeChatId: "" });
-        get().pushEvent("connection", "Connected — no chat history on this account yet.");
+      const fresh = result.data.chats.map(toChatPreview);
+      set((s) => {
+        // Keep pages the user already scrolled to; refresh the first page in place.
+        const firstIds = new Set(fresh.map((c) => c.id));
+        const tail = s.chats.slice(CHATS_PAGE).filter((c) => !firstIds.has(c.id));
+        const chats = [...fresh, ...tail];
+        const activeChatId = chats.some((c) => c.id === s.activeChatId) ? s.activeChatId : (chats[0]?.id ?? "");
+        return { chats, chatsHasMore: result.data!.hasMore, activeChatId };
+      });
+      if (fresh.length === 0) {
+        get().pushEvent("connection", `Connected — no chat history on ${session.name || session.sessionId} yet.`);
         return;
       }
-      set((s) => ({ chats, activeChatId: chats.some((c) => c.id === s.activeChatId) ? s.activeChatId : chats[0].id }));
-      get().pushEvent("connection", `Loaded ${chats.length} real chats`);
-      await get().loadMessages(get().activeChatId);
+      const { activeChatId, threads } = get();
+      if (activeChatId && !threads[activeChatId]) await get().loadMessages(activeChatId);
     } catch {
       get().pushEvent("error", "Could not load chats");
+    } finally {
+      set({ chatsLoading: false });
     }
   },
 
-  /** Load one conversation's history into `threads` on demand. */
-  loadMessages: async (chatId) => {
-    const { live, sessions } = get();
-    if (!live || !chatId) return;
-    const session = sessions.find((s) => s.status === "connected");
-    if (!session) return;
+  loadMoreChats: async () => {
+    const session = activeSession(get());
+    const { chats, chatsHasMore, chatsLoading } = get();
+    if (!session || session.status !== "connected" || !chatsHasMore || chatsLoading) return;
+    set({ chatsLoading: true });
     try {
-      const result = await listMessages(session.sessionId, chatId);
+      const result = await listChats(session.sessionId, CHATS_PAGE, chats.length);
+      if (get().activeAccountId !== session.sessionId) return;
+      if (!result.success || !result.data) return;
+      const more = result.data.chats.map(toChatPreview);
+      set((s) => {
+        const known = new Set(s.chats.map((c) => c.id));
+        return { chats: [...s.chats, ...more.filter((c) => !known.has(c.id))], chatsHasMore: result.data!.hasMore };
+      });
+    } catch {
+      get().pushToast("error", "Could not load more chats");
+    } finally {
+      set({ chatsLoading: false });
+    }
+  },
+
+  /**
+   * Load the newest page of one conversation. Already-loaded threads are left
+   * alone unless `force` (the inbox poll) — then the newest page is merged in
+   * without losing older pages the user scrolled to.
+   */
+  loadMessages: async (chatId, opts = {}) => {
+    const session = activeSession(get());
+    if (!chatId || !session || session.status !== "connected") return;
+    const existing = get().threadMeta[chatId];
+    if (existing && !opts.force) return;
+    if (existing?.loading) return;
+    set((s) => ({ threadMeta: { ...s.threadMeta, [chatId]: { ...(existing ?? { cursor: null, hasMore: false }), loading: true } } }));
+    try {
+      const result = await listMessages(session.sessionId, chatId, MESSAGES_PAGE, null);
+      if (get().activeAccountId !== session.sessionId) return;
       if (!result.success || !result.data) return;
       // Backend returns newest-first; the bubble list renders oldest at top.
-      const bubbles = result.data.messages.map(toBubble).reverse();
-      if (bubbles.length === 0) return;
-      set((s) => ({ threads: { ...s.threads, [chatId]: bubbles } }));
+      const page = result.data.messages.map(toBubble).reverse();
+      set((s) => {
+        const current = s.threads[chatId] ?? [];
+        const pageIds = new Set(page.map((b) => b.id));
+        // Older pages (before the newest page) + pending optimistic bubbles survive the merge.
+        const older = current.filter((b) => !pageIds.has(b.id) && !(b.kind === "text" && b.pending));
+        const pending = current.filter((b) => b.kind === "text" && b.pending && !pageIds.has(b.id));
+        const merged = existing ? [...older.filter((b) => !isNewerThanPage(b, current, page)), ...page, ...pending] : page;
+        const meta = existing
+          ? { cursor: existing.cursor ?? result.data!.cursor, hasMore: existing.cursor ? existing.hasMore : result.data!.hasMore, loading: false }
+          : { cursor: result.data!.cursor, hasMore: result.data!.hasMore, loading: false };
+        return { threads: { ...s.threads, [chatId]: merged }, threadMeta: { ...s.threadMeta, [chatId]: meta } };
+      });
     } catch {
-      /* keep whatever is already on screen */
+      set((s) => ({ threadMeta: { ...s.threadMeta, [chatId]: { ...(s.threadMeta[chatId] ?? { cursor: null, hasMore: false }), loading: false } } }));
+    }
+  },
+
+  /** Prepend the page before the oldest loaded message. */
+  loadOlderMessages: async (chatId) => {
+    const session = activeSession(get());
+    const meta = get().threadMeta[chatId];
+    if (!session || session.status !== "connected" || !meta || !meta.hasMore || meta.loading || !meta.cursor) return;
+    set((s) => ({ threadMeta: { ...s.threadMeta, [chatId]: { ...meta, loading: true } } }));
+    try {
+      const result = await listMessages(session.sessionId, chatId, MESSAGES_PAGE, meta.cursor);
+      if (!result.success || !result.data) throw new Error(result.message);
+      const older = result.data.messages.map(toBubble).reverse();
+      set((s) => {
+        const known = new Set((s.threads[chatId] ?? []).map((b) => b.id));
+        return {
+          threads: { ...s.threads, [chatId]: [...older.filter((b) => !known.has(b.id)), ...(s.threads[chatId] ?? [])] },
+          threadMeta: {
+            ...s.threadMeta,
+            [chatId]: { cursor: result.data!.cursor ?? meta.cursor, hasMore: result.data!.hasMore && older.length > 0, loading: false },
+          },
+        };
+      });
+    } catch {
+      set((s) => ({ threadMeta: { ...s.threadMeta, [chatId]: { ...meta, loading: false } } }));
+      get().pushToast("error", "Could not load older messages");
+    }
+  },
+
+  loadMedia: async (chatId, messageId) => {
+    const session = activeSession(get());
+    if (!session) return null;
+    const mark = (patch: Partial<BubbleMedia>) =>
+      set((s) => ({
+        threads: patchBubble(s.threads, chatId, messageId, (b) =>
+          b.kind === "text" && b.media ? { ...b, media: { ...b.media, ...patch } } : b,
+        ),
+      }));
+    mark({ loading: true });
+    try {
+      const result = await fetchMessageMedia(session.sessionId, chatId, messageId);
+      if (!result.success || !result.data) {
+        mark({ loading: false });
+        get().pushToast("error", result.message || "Media unavailable");
+        return null;
+      }
+      mark({ loading: false, url: result.data.url, mimetype: result.data.mimetype, filename: result.data.filename });
+      return result.data.url;
+    } catch {
+      mark({ loading: false });
+      get().pushToast("error", "Gateway unreachable — media not loaded");
+      return null;
     }
   },
 
@@ -287,55 +561,107 @@ export const useGateway = create<State>((set, get) => ({
     // Fire-and-forget: opening a chat must not block on history.
     void get().loadMessages(id);
   },
-  // The Broadcast panel follows the account picked in the rail.
-  selectAccount: (id) => set((s) => (s.bulkSessionId === id ? { activeAccountId: id } : { activeAccountId: id, bulkSessionId: id, bulkJobs: [] })),
+
+  /** Switch the inbox (and the Broadcast panel) to another account. */
+  selectAccount: (id) => {
+    if (id === get().activeAccountId) return;
+    set({
+      activeAccountId: id,
+      bulkSessionId: id,
+      bulkJobs: [],
+      chats: [],
+      chatsHasMore: false,
+      threads: {},
+      threadMeta: {},
+      activeChatId: "",
+      composer: "",
+    });
+    void get().loadChats();
+  },
   setComposer: (composer) => set({ composer }),
   setContactTab: (contactTab) => set({ contactTab }),
   setMobilePane: (mobilePane) => set({ mobilePane }),
 
   sendComposer: async () => {
-    const { composer, activeChatId, live, sessions, chats, pushToast, pushEvent } = get();
+    const { composer, activeChatId, live, pushToast, pushEvent } = get();
+    const session = activeSession(get());
     const text = composer.trim();
-    if (!text) return;
+    if (!text || !activeChatId) return;
+    if (!live || !session || session.status !== "connected") {
+      pushToast("error", live ? "This account is not connected" : "Not connected to the gateway");
+      return;
+    }
     const time = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-    const bubble: Bubble = { id: nid(), kind: "text", from: "me", text, time };
+    const tempId = nid();
+    const bubble: Bubble = { id: tempId, kind: "text", from: "me", text, time, pending: true };
     set((s) => ({
       composer: "",
-      threads: {
-        ...s.threads,
-        [activeChatId]: [...(s.threads[activeChatId] ?? []), bubble],
-      },
+      threads: { ...s.threads, [activeChatId]: [...(s.threads[activeChatId] ?? []), bubble] },
       chats: s.chats.map((c) => (c.id === activeChatId ? { ...c, preview: text, time } : c)),
     }));
-    pushEvent("message", `Sent: ${text.slice(0, 60)}`);
-    if (live) {
-      const session = sessions.find((x) => x.status === "connected") ?? sessions[0];
-      const chat = chats.find((c) => c.id === activeChatId);
-      try {
-        await sendText({
-          sessionId: session?.sessionId ?? "",
-          chatId: chat?.phone?.replace(/\s/g, "") ?? activeChatId,
-          message: text,
-        });
-      } catch {
-        // Roll the optimistic bubble back — nothing was delivered.
-        set((s) => ({
-          threads: {
-            ...s.threads,
-            [activeChatId]: (s.threads[activeChatId] ?? []).filter((b) => b.id !== bubble.id),
-          },
-        }));
-        pushToast("error", "Send failed — message not delivered");
-        pushEvent("error", `Send failed: ${text.slice(0, 60)}`);
-      }
-    } else {
+    try {
+      const result = await sendText({ sessionId: session.sessionId, chatId: activeChatId, message: text });
+      if (!result.success) throw new Error(result.message || "Send failed");
+      const realId = result.data?.messageId ?? tempId;
       set((s) => ({
-        threads: {
-          ...s.threads,
-          [activeChatId]: (s.threads[activeChatId] ?? []).filter((b) => b.id !== bubble.id),
-        },
+        threads: patchBubble(s.threads, activeChatId, tempId, (b) => ({ ...b, id: realId, pending: false })),
       }));
-      pushToast("error", "Not connected to the gateway");
+      pushEvent("message", `Sent: ${text.slice(0, 60)}`);
+    } catch (err) {
+      // Roll the optimistic bubble back — nothing was delivered.
+      set((s) => ({ threads: patchBubble(s.threads, activeChatId, tempId, () => null) }));
+      pushToast("error", `Send failed — ${err instanceof Error ? err.message : "message not delivered"}`);
+      pushEvent("error", `Send failed: ${text.slice(0, 60)}`);
+    }
+  },
+
+  /** Upload + send a file to the open chat. Resolves true when WhatsApp accepted it. */
+  sendAttachment: async (file, caption, asDocument = false) => {
+    const { activeChatId, live, pushToast, pushEvent } = get();
+    const session = activeSession(get());
+    if (!activeChatId) return false;
+    if (!live || !session || session.status !== "connected") {
+      pushToast("error", live ? "This account is not connected" : "Not connected to the gateway");
+      return false;
+    }
+    const time = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    const tempId = nid();
+    const localUrl = URL.createObjectURL(file);
+    const type = mediaTypeForFile(file, asDocument);
+    const bubble: Bubble = {
+      id: tempId,
+      kind: "text",
+      from: "me",
+      text: caption,
+      time,
+      pending: true,
+      media: { type, url: localUrl, mimetype: file.type || null, filename: file.name },
+    };
+    set((s) => ({
+      composer: "",
+      threads: { ...s.threads, [activeChatId]: [...(s.threads[activeChatId] ?? []), bubble] },
+      chats: s.chats.map((c) => (c.id === activeChatId ? { ...c, preview: caption || `📎 ${file.name}`, time } : c)),
+    }));
+    try {
+      const result = await sendMediaFile({ sessionId: session.sessionId, chatId: activeChatId, file, caption, asDocument });
+      if (!result.success || !result.data) throw new Error(result.message || "Send failed");
+      const data = result.data;
+      set((s) => ({
+        threads: patchBubble(s.threads, activeChatId, tempId, (b) =>
+          b.kind === "text"
+            ? { ...b, id: data.messageId, pending: false, media: { type: data.type as BubbleMediaType, url: data.mediaUrl, mimetype: data.mimetype, filename: data.filename } }
+            : b,
+        ),
+      }));
+      URL.revokeObjectURL(localUrl);
+      pushEvent("message", `Sent ${data.type}: ${file.name}`);
+      return true;
+    } catch (err) {
+      set((s) => ({ threads: patchBubble(s.threads, activeChatId, tempId, () => null) }));
+      URL.revokeObjectURL(localUrl);
+      pushToast("error", `Send failed — ${err instanceof Error ? err.message : "file not delivered"}`);
+      pushEvent("error", `Send failed: ${file.name}`);
+      return false;
     }
   },
 
@@ -380,7 +706,7 @@ export const useGateway = create<State>((set, get) => ({
     }
     set((s) => ({
       sessions: [
-        ...s.sessions,
+        ...s.sessions.filter((x) => x.sessionId !== id),
         {
           sessionId: id,
           name: id,
@@ -397,97 +723,6 @@ export const useGateway = create<State>((set, get) => ({
     get().pushToast("success", "Scan QR to connect");
     await get().refreshQr(id);
     get().watchQrSession(id);
-  },
-
-  reconnect: async (id) => {
-    try {
-      if (get().live) await connectSession(id, {});
-      get().pushToast("success", "Reconnecting…");
-      get().openOverlay("qr", id);
-      await get().refreshQr(id);
-    } catch {
-      get().pushToast("error", "Failed to reconnect");
-    }
-  },
-
-  removeSession: async (id) => {
-    try {
-      if (get().live) await apiDeleteSession(id);
-    } catch {
-      /* already reported to the user via a toast */
-    }
-    set((s) => ({ sessions: s.sessions.filter((x) => x.sessionId !== id) }));
-    get().pushToast("success", "Session deleted");
-  },
-
-  refreshQr: async (id) => {
-    set({ qrSession: id, qrSrc: "" });
-    for (let attempt = 0; attempt < 30; attempt += 1) {
-      try {
-        const result = await getQr(id);
-        if (result.success && result.data?.qrCode) {
-          set({
-            qrSrc: result.data.qrCode,
-            qrSession: id,
-            qrExpiresAt: result.data.qrExpiresAt ?? null,
-          });
-          return;
-        }
-      } catch {
-        /* Retry while the session is still generating its QR code. */
-      }
-      await new Promise((resolve) => setTimeout(resolve, 500));
-    }
-  },
-
-  /**
-   * While the QR modal is open, poll the gateway: keep the QR image fresh as
-   * the backend rotates it, and close the modal the moment pairing finishes
-   * (connected) or is revoked (qr_expired). The dashboard has no push channel
-   * to the backend, so this watcher is what closes the loop.
-   */
-  watchQrSession: (id) => {
-    if (qrWatchTimer) clearInterval(qrWatchTimer);
-    qrWatchTimer = setInterval(async () => {
-      const { overlay, qrSession } = get();
-      if (overlay !== "qr" || !qrSession || qrSession !== id) return;
-      try {
-        const [qr, list] = await Promise.all([getQr(qrSession), listSessions()]);
-        if (qr.success && qr.data?.qrCode && qr.data.qrCode !== get().qrSrc) {
-          set({ qrSrc: qr.data.qrCode });
-        }
-        if (qr.success && qr.data?.qrExpiresAt && qr.data.qrExpiresAt !== get().qrExpiresAt) {
-          set({ qrExpiresAt: qr.data.qrExpiresAt });
-        }
-        const sessions = list.success && Array.isArray(list.data) ? list.data : undefined;
-        const status = sessions?.find((s) => s.sessionId === qrSession)?.status;
-        if (status === "connected") {
-          get().closeOverlay();
-          get().pushToast("success", "WhatsApp linked successfully");
-          get().pushEvent("connection", `Session ${qrSession} connected`);
-          await get().loadChats();
-        } else if (status === "qr_expired") {
-          set((s) => ({ sessions: sessions ?? s.sessions }));
-          get().closeOverlay();
-          get().pushToast("error", "QR expired — session revoked. Reconnect for a new QR.");
-          get().pushEvent("error", `Session ${qrSession} QR expired`);
-        } else if (sessions) {
-          set({ sessions });
-        }
-      } catch {
-        /* gateway hiccup — retry on the next tick */
-      }
-    }, 2000);
-  },
-
-  refreshSessions: async () => {
-    if (!get().live) return;
-    try {
-      const result = await listSessions();
-      if (result.success && Array.isArray(result.data)) set({ sessions: result.data });
-    } catch {
-      /* keep what we have */
-    }
   },
 
   setProxy: async (sessionId, proxy) => {
@@ -530,6 +765,97 @@ export const useGateway = create<State>((set, get) => ({
     } catch {
       return { ok: false, message: "Gateway unreachable" };
     }
+  },
+
+  reconnect: async (id) => {
+    try {
+      if (get().live) await connectSession(id, {});
+      get().pushToast("success", "Reconnecting…");
+      get().openOverlay("qr", id);
+      await get().refreshQr(id);
+    } catch {
+      get().pushToast("error", "Failed to reconnect");
+    }
+  },
+
+  removeSession: async (id) => {
+    try {
+      if (get().live) await apiDeleteSession(id);
+    } catch {
+      /* already reported to the user via a toast */
+    }
+    set((s) => ({ sessions: s.sessions.filter((x) => x.sessionId !== id) }));
+    get().pushToast("success", "Session deleted");
+    get().pushEvent("connection", `Session ${id} deleted`);
+    if (get().activeAccountId === id) {
+      const next = get().sessions.find((s) => s.status === "connected") ?? get().sessions[0];
+      set({ activeAccountId: next?.sessionId ?? "", chats: [], threads: {}, threadMeta: {}, activeChatId: "" });
+      if (next) await get().loadChats();
+    }
+  },
+
+  refreshQr: async (id) => {
+    set({ qrSession: id, qrSrc: "" });
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      try {
+        const result = await getQr(id);
+        if (result.success && result.data?.qrCode) {
+          set({
+            qrSrc: result.data.qrCode,
+            qrSession: id,
+            qrExpiresAt: result.data.qrExpiresAt ?? null,
+          });
+          return;
+        }
+      } catch {
+        /* Retry while the session is still generating its QR code. */
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  },
+
+  /**
+   * While the QR modal is open, poll the gateway: keep the QR image fresh as
+   * the backend rotates it, and close the modal the moment pairing finishes
+   * (connected) or is revoked (qr_expired). The newly linked account becomes
+   * the active one and its chats load — no page refresh needed.
+   */
+  watchQrSession: (id) => {
+    if (qrWatchTimer) clearInterval(qrWatchTimer);
+    qrWatchTimer = setInterval(async () => {
+      const { overlay, qrSession } = get();
+      if (overlay !== "qr" || !qrSession || qrSession !== id) return;
+      try {
+        const [qr, list] = await Promise.all([getQr(qrSession), listSessions()]);
+        if (qr.success && qr.data?.qrCode && qr.data.qrCode !== get().qrSrc) {
+          set({ qrSrc: qr.data.qrCode });
+        }
+        if (qr.success && qr.data?.qrExpiresAt && qr.data.qrExpiresAt !== get().qrExpiresAt) {
+          set({ qrExpiresAt: qr.data.qrExpiresAt });
+        }
+        const sessions = list.success && Array.isArray(list.data) ? list.data : undefined;
+        const status = sessions?.find((s) => s.sessionId === qrSession)?.status;
+        if (status === "connected") {
+          // Write the fresh list back BEFORE loading chats, or the account still
+          // reads as qr_ready and the inbox stays empty until a refresh.
+          set((s) => ({ sessions: sessions ?? s.sessions }));
+          get().closeOverlay();
+          get().pushToast("success", "WhatsApp linked successfully");
+          get().pushEvent("connection", `Session ${qrSession} connected`);
+          if (get().activeAccountId !== qrSession) get().selectAccount(qrSession);
+          else await get().loadChats();
+        } else if (status === "qr_expired") {
+          set((s) => ({ sessions: sessions ?? s.sessions }));
+          get().closeOverlay();
+          get().pushToast("error", "QR expired — session revoked. Reconnect for a new QR.");
+          get().pushEvent("error", `Session ${qrSession} QR expired`);
+        } else if (sessions) {
+          set({ sessions });
+        }
+      } catch {
+        /* gateway hiccup — retry on the next tick */
+      }
+    }, 2000);
   },
 
   addHook: async (url, events) => {
@@ -630,22 +956,31 @@ export const useGateway = create<State>((set, get) => ({
       pushToast("error", "Not connected to the gateway");
       return null;
     }
-    const session = input.sessionId
-      ? sessions.find((s) => s.sessionId === input.sessionId)
-      : pickBulkSession(sessions, activeAccountId);
-    if (!session || session.status !== "connected") {
-      pushToast("error", "Pick a connected session to send from");
+    // Use the requested accounts (keeping their order = rotation order), but
+    // only the connected ones; fall back to the best single account.
+    const requested = input.sessionIds && input.sessionIds.length ? input.sessionIds : undefined;
+    const lanes = requested
+      ? requested.filter((id) => sessions.find((s) => s.sessionId === id)?.status === "connected")
+      : [pickBulkSession(sessions, activeAccountId)?.sessionId].filter((x): x is string => Boolean(x));
+    const connectedLanes = lanes.filter((id) => sessions.find((s) => s.sessionId === id)?.status === "connected");
+    if (connectedLanes.length === 0) {
+      pushToast("error", "Pick at least one connected account to send from");
       return null;
     }
     try {
-      const result = await startBulkJob({ ...input, sessionId: session.sessionId });
+      const result = await startBulkJob({ ...input, sessionIds: connectedLanes });
       if (!result.success || !result.data) {
         pushToast("error", result.message || "Could not start campaign");
         return null;
       }
-      pushEvent("message", `Campaign ${result.data.jobId} started: ${result.data.total} recipients`);
-      pushToast("success", `Sending to ${result.data.total} recipients`);
-      set({ overlay: null, nav: "broadcast", bulkSessionId: session.sessionId });
+      const owner = result.data.sessionIds?.[0] ?? connectedLanes[0];
+      const laneCount = result.data.sessionIds?.length ?? connectedLanes.length;
+      pushEvent("message", `Campaign ${result.data.jobId} started: ${result.data.total} recipients across ${laneCount} account(s)`);
+      pushToast("success", `Sending to ${result.data.total} recipients from ${laneCount} account(s)`);
+      if (result.data.skippedSessions?.length) {
+        pushToast("info", `Skipped (not connected): ${result.data.skippedSessions.join(", ")}`);
+      }
+      set({ overlay: null, nav: "broadcast", bulkSessionId: owner });
       await get().loadBulkJobs();
       return result.data.jobId;
     } catch {
@@ -753,3 +1088,15 @@ export const useGateway = create<State>((set, get) => ({
     set({ apiKey: k });
   },
 }));
+
+/**
+ * During a forced refresh the newest page replaces whatever was at the tail of
+ * the thread. A bubble that is not in the page but sits *after* the oldest
+ * page message (e.g. a message deleted meanwhile) must not be kept at the end.
+ */
+function isNewerThanPage(b: Bubble, current: Bubble[], page: Bubble[]): boolean {
+  if (page.length === 0) return false;
+  const firstPageIdx = current.findIndex((x) => x.id === page[0].id);
+  if (firstPageIdx === -1) return false;
+  return current.indexOf(b) > firstPageIdx;
+}
