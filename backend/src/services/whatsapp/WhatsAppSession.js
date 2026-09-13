@@ -35,6 +35,9 @@ class WhatsAppSession {
         this.qrTimer = null;
         this.qrExpired = false;
         this.qrExpiresAt = null;
+        // True once the auth creds are paired/registered. A registered session must
+        // NEVER be treated as an expired QR (that would delete its whole folder).
+        this.registered = false;
 
         // Custom metadata and webhook
         this.metadata = options.metadata || {};
@@ -218,6 +221,7 @@ class WhatsAppSession {
             }
 
             const { state, saveCreds } = await useMultiFileAuthState(this.authFolder);
+            this.registered = Boolean(state.creds && state.creds.registered);
             const { version } = await fetchLatestBaileysVersion();
 
             this.socket = makeWASocket({
@@ -299,7 +303,8 @@ class WhatsAppSession {
             clearInterval(this.storeInterval);
             this.storeInterval = null;
         }
-        this.deleteAuthFolder();
+        // Only wipe creds for an unpaired session; a paired one is never QR-expired.
+        if (!this.registered) this.deleteAuthFolder();
     }
 
     _setupEventListeners(saveCreds) {
@@ -323,9 +328,10 @@ class WhatsAppSession {
                 const reason = lastDisconnect?.error?.message;
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
                 const qrExpired =
-                    this.qrExpired ||
-                    reason === 'QR refs attempts ended' ||
-                    (statusCode === DisconnectReason.timedOut && !this.phoneNumber);
+                    !this.registered &&
+                    (this.qrExpired ||
+                        reason === 'QR refs attempts ended' ||
+                        (statusCode === DisconnectReason.timedOut && !this.phoneNumber));
 
                 console.log(`[${this.sessionId}] Connection closed:`, reason);
 
