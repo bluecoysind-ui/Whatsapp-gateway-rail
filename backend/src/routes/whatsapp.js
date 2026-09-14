@@ -2,7 +2,8 @@ const express = require('express');
 const router = express.Router();
 const whatsappManager = require('../services/whatsapp');
 const bulkJobManager = require('../services/whatsapp/BulkJobManager');
-const { parseProxyUrl, checkProxy } = require('../services/whatsapp/proxy');
+const { parseProxyUrl, checkProxy, getDefaultProxyUrl } = require('../services/whatsapp/proxy');
+const proxyManager = require('../services/whatsapp/ProxyManager');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
@@ -71,6 +72,83 @@ const normaliseProxyInput = (value) => {
 /** Connection states in which a proxy change needs a socket restart to take effect. */
 const LIVE_STATES = new Set(['connecting', 'qr_ready', 'connected']);
 
+const sanitisePhone = (value) => String(value || '').replace(/\D/g, '');
+
+const qrLinkPayload = (info, { username, phoneNumber }) => ({
+    username,
+    phone_number: info?.phoneNumber || phoneNumber,
+    sessionId: info?.sessionId || phoneNumber,
+    qrCode: info?.qrCode || null,
+    qrExpiresAt: info?.qrExpiresAt || null,
+    status: info?.status || null
+});
+
+/**
+ * GET /api/whatsapp/qr?username=...&phone_number=...
+ * Creates (or reuses) a session for that phone, waits for the QR, and returns
+ * base64 QR data plus expiry. After a successful scan the gateway POSTs to
+ * Bluecoys /api/whatsapp-linked with the connected number and username.
+ */
+router.get('/qr', async (req, res) => {
+    try {
+        const username = String(req.query.username || '').trim();
+        const phoneNumber = sanitisePhone(req.query.phone_number || req.query.phoneNumber || req.query.phone);
+
+        if (!username) {
+            return res.status(400).json({
+                success: false,
+                message: 'Missing required query parameter: username'
+            });
+        }
+        if (!phoneNumber) {
+            return res.status(400).json({
+                success: false,
+                message: 'Missing required query parameter: phone_number'
+            });
+        }
+        if (!/^[a-zA-Z0-9_-]+$/.test(phoneNumber)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid phone_number'
+            });
+        }
+
+        const result = await whatsappManager.startQrLink({ username, phoneNumber });
+        const data = qrLinkPayload(result.data, { username, phoneNumber });
+
+        if (result.data?.isConnected) {
+            return res.json({
+                success: true,
+                message: 'Already connected to WhatsApp',
+                data: { ...data, qrCode: null, qrExpiresAt: null }
+            });
+        }
+
+        if (result.success && result.data?.qrCode) {
+            return res.json({
+                success: true,
+                message: 'QR Code ready',
+                data
+            });
+        }
+
+        const status = result.data?.status;
+        const statusCode = status === 'qr_expired' ? 410 : 202;
+        return res.status(statusCode).json({
+            success: false,
+            message: result.message || (status === 'qr_expired'
+                ? 'QR code expired. Retry this request for a new one.'
+                : 'QR code not available yet. Please retry.'),
+            data
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
+});
+
 // Get all sessions
 router.get('/sessions', (req, res) => {
     try {
@@ -87,6 +165,7 @@ router.get('/sessions', (req, res) => {
                 webhooks: s.webhooks || [],
                 metadata: s.metadata || {},
                 proxy: s.proxy || null,
+                proxyInfo: s.proxyInfo || null,
                 sync: s.sync || null
             }))
         });
@@ -155,6 +234,7 @@ router.get('/sessions/:sessionId/status', (req, res) => {
                 metadata: info.metadata,
                 webhooks: info.webhooks,
                 proxy: info.proxy,
+                proxyInfo: info.proxyInfo || null,
                 sync: info.sync || null
             }
         });
@@ -230,6 +310,16 @@ router.patch('/sessions/:sessionId/config', async (req, res) => {
     }
 });
 
+// Gateway-wide proxy pool status: size, whether direct connection is disabled,
+// each proxy's health/cooldown, and which accounts are assigned to it.
+router.get('/proxy/status', (_req, res) => {
+    try {
+        res.json({ success: true, data: proxyManager.poolStatus() });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
 // Test a proxy: fetch the egress IP through it. Pass `proxy` directly, or
 // `sessionId` to test the proxy that session has configured.
 router.post('/proxy/test', async (req, res) => {
@@ -238,26 +328,32 @@ router.post('/proxy/test', async (req, res) => {
         let target = proxy;
 
         if (target === undefined || target === null || target === '') {
-            if (!sessionId) {
-                return res.status(400).json({
-                    success: false,
-                    message: 'Provide proxy (URL) or sessionId'
-                });
+            if (sessionId) {
+                const session = whatsappManager.getSession(sessionId);
+                if (!session) {
+                    return res.status(404).json({
+                        success: false,
+                        message: 'Session not found'
+                    });
+                }
+                // Effective proxy: the session's own proxy, else the env default.
+                target = session.proxy || getDefaultProxyUrl();
+                if (!target) {
+                    return res.status(400).json({
+                        success: false,
+                        message: 'Session has no proxy configured and no default proxy is set'
+                    });
+                }
+            } else {
+                // No proxy and no session: fall back to the gateway-wide env default.
+                target = getDefaultProxyUrl();
+                if (!target) {
+                    return res.status(400).json({
+                        success: false,
+                        message: 'Provide proxy (URL) or sessionId, or configure a default proxy via env'
+                    });
+                }
             }
-            const session = whatsappManager.getSession(sessionId);
-            if (!session) {
-                return res.status(404).json({
-                    success: false,
-                    message: 'Session not found'
-                });
-            }
-            if (!session.proxy) {
-                return res.status(400).json({
-                    success: false,
-                    message: 'Session has no proxy configured'
-                });
-            }
-            target = session.proxy;
         }
 
         try {

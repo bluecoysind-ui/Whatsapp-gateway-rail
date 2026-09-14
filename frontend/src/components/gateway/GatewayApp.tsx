@@ -158,6 +158,17 @@ function MobileDock() {
   );
 }
 
+/** host:port from a redacted proxy URL, for the account hover card. */
+function proxyHostPort(url?: string | null): string | null {
+  if (!url) return null;
+  try {
+    const parsed = new URL(url);
+    return parsed.port ? `${parsed.hostname}:${parsed.port}` : parsed.hostname;
+  } catch {
+    return url;
+  }
+}
+
 function AccountsRail() {
   const nav = useGateway((s) => s.nav);
   const setNav = useGateway((s) => s.setNav);
@@ -170,6 +181,7 @@ function AccountsRail() {
     label: string;
     phone?: string;
     proxy?: string | null;
+    proxyInfo?: GatewaySession["proxyInfo"];
     status: string;
     connected: boolean;
     x: number;
@@ -180,7 +192,8 @@ function AccountsRail() {
     setPeek({
       label: a.name || a.sessionId,
       phone: a.phoneNumber,
-      proxy: a.proxy,
+      proxy: a.proxyInfo?.active ?? a.proxy,
+      proxyInfo: a.proxyInfo,
       status: a.status,
       connected: a.status === "connected",
       x: r.right,
@@ -226,6 +239,17 @@ function AccountsRail() {
                 {connected ? (
                   <span className="absolute right-0.5 bottom-0.5 size-2.5 rounded-full border-2 border-night bg-wa" />
                 ) : null}
+                {a.proxyInfo?.active ? (
+                  <span
+                    title={`Proxy: ${a.proxyInfo.active}`}
+                    className={cn(
+                      "absolute left-0.5 top-0.5 grid size-3.5 place-items-center rounded-full border border-night text-[7px] font-bold leading-none",
+                      a.proxyInfo.connected ? "bg-indigo-400 text-night" : "bg-white/40 text-night",
+                    )}
+                  >
+                    P
+                  </span>
+                ) : null}
               </button>
             </div>
           );
@@ -257,11 +281,31 @@ function AccountsRail() {
         ? createPortal(
             <div
               style={{ left: peek.x + 12, top: peek.y }}
-              className="pointer-events-none fixed z-50 w-44 -translate-y-1/2 rounded-xl border border-white/15 bg-[rgba(24,20,58,0.82)] p-3 text-left shadow-[0_12px_30px_rgba(8,4,28,0.45)] backdrop-blur-xl"
+              className="pointer-events-none fixed z-[80] w-56 -translate-y-1/2 rounded-xl border border-white/15 bg-[rgba(24,20,58,0.94)] p-3 text-left shadow-[0_12px_30px_rgba(8,4,28,0.45)] backdrop-blur-xl"
             >
               <div className="truncate text-sm font-semibold text-white">{peek.label}</div>
               <div className="mt-1 truncate text-xs text-cyan-200">{peek.phone ?? "Not linked"}</div>
-              {peek.proxy ? <div className="mt-0.5 truncate font-mono text-[10px] text-indigo-200">via {peek.proxy}</div> : null}
+              <div className="mt-2 rounded-lg border border-indigo-400/25 bg-indigo-500/15 p-2">
+                <div className="text-[9px] font-semibold uppercase tracking-[0.14em] text-indigo-200">Proxy</div>
+                {peek.proxy ? (
+                  <>
+                    <div className="mt-1 break-all font-mono text-[12px] leading-snug text-white">
+                      {proxyHostPort(peek.proxy)}
+                    </div>
+                    <div className="mt-0.5 break-all font-mono text-[9px] leading-snug text-indigo-100/80">{peek.proxy}</div>
+                    <div className="mt-1 text-[9px] text-indigo-100/90">
+                      {peek.proxyInfo?.connected ? "Connected through this proxy" : "Assigned · not on this socket yet"}
+                      {peek.proxyInfo?.source === "pool" && peek.proxyInfo.poolSize > 0
+                        ? ` · pool ${(peek.proxyInfo.index ?? 0) + 1}/${peek.proxyInfo.poolSize}`
+                        : peek.proxyInfo?.source === "session"
+                          ? " · session proxy"
+                          : ""}
+                    </div>
+                  </>
+                ) : (
+                  <div className="mt-1 text-[11px] text-amber-200">Direct connection · no proxy assigned</div>
+                )}
+              </div>
               <div className="mt-2 flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-[0.12em] text-wa">
                 <span
                   className={cn(

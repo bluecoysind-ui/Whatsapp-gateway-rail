@@ -147,6 +147,68 @@ class WhatsAppManager {
         }
         return session.getInfo();
     }
+
+    /**
+     * Poll until a session has a QR (or is already connected / expired).
+     * @param {string} sessionId
+     * @param {{ timeoutMs?: number, intervalMs?: number }} [opts]
+     * @returns {Promise<Object|null>}
+     */
+    async waitForQr(sessionId, { timeoutMs = 45_000, intervalMs = 300 } = {}) {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+            const session = this.sessions.get(sessionId);
+            if (!session) return null;
+            const info = session.getInfo();
+            if (info.qrCode || info.isConnected || info.status === 'qr_expired' || info.status === 'logged_out' || info.status === 'error') {
+                return info;
+            }
+            await new Promise((resolve) => setTimeout(resolve, intervalMs));
+        }
+        return this.sessions.get(sessionId)?.getInfo() || null;
+    }
+
+    /**
+     * Start (or reuse) a session keyed by phone number and wait for its QR.
+     * Stores `username` on the session so the linked/disconnected callbacks can
+     * send it back to Bluecoys.
+     * @param {{ username: string, phoneNumber: string }} params
+     */
+    async startQrLink({ username, phoneNumber }) {
+        const sessionId = phoneNumber;
+        const options = {
+            metadata: {
+                username,
+                expectedPhoneNumber: phoneNumber
+            }
+        };
+
+        const existing = this.getSession(sessionId);
+        if (existing) {
+            existing.updateConfig(options);
+            if (existing.connectionStatus === 'connected') {
+                return { success: true, data: existing.getInfo() };
+            }
+            const hasFreshQr = existing.connectionStatus === 'qr_ready' && existing.qrCode;
+            if (!hasFreshQr && existing.connectionStatus !== 'connecting') {
+                await existing.connect();
+            }
+        } else {
+            const created = await this.createSession(sessionId, options);
+            if (!created.success && created.data?.status !== 'connected') {
+                return { success: false, message: created.message, data: created.data || null };
+            }
+            if (created.data?.status === 'connected') {
+                return { success: true, data: created.data };
+            }
+        }
+
+        const info = await this.waitForQr(sessionId);
+        if (!info) {
+            return { success: false, message: 'Session not found', data: null };
+        }
+        return { success: Boolean(info.qrCode || info.isConnected), data: info };
+    }
 }
 
 module.exports = WhatsAppManager;

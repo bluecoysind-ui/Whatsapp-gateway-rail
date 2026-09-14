@@ -125,6 +125,118 @@ function buildProxyAgents(url) {
 }
 
 /**
+ * Expand a port specification into a flat list of port numbers.
+ * Accepts comma/space separated single ports and inclusive ranges, e.g.
+ * "10001, 10002" or "10001-10010" or a mix. Handy for rotating datacenter
+ * proxies (Decodo/Smartproxy) that expose one IP per port.
+ * @param {string|undefined|null} spec
+ * @returns {number[]}
+ */
+function expandPorts(spec) {
+    if (!spec) return [];
+    const out = [];
+    for (const part of String(spec).split(/[\s,]+/)) {
+        if (!part) continue;
+        const range = part.match(/^(\d+)\s*-\s*(\d+)$/);
+        if (range) {
+            let a = Number(range[1]);
+            let b = Number(range[2]);
+            if (a > b) [a, b] = [b, a];
+            for (let p = a; p <= b && out.length < 1000; p++) out.push(p);
+        } else if (/^\d+$/.test(part)) {
+            out.push(Number(part));
+        }
+    }
+    return out;
+}
+
+/**
+ * Build the ordered pool of proxy URLs the gateway rotates through.
+ *
+ * Sources are merged in this order, de-duplicated, invalid entries dropped:
+ *   1. PROXY_URLS — a list (comma/space/newline separated) of full proxy URLs.
+ *   2. PROXY_URL  — a single full URL (http/https/socks5/socks4).
+ *   3. Components — PROXY_PROTOCOL / PROXY_HOST / PROXY_USERNAME / PROXY_PASSWORD,
+ *      optionally expanded across PROXY_PORTS ("10001-10010" or "10001,10002")
+ *      for providers like Decodo where each port is a different egress IP.
+ *      Falls back to a single PROXY_PORT when PROXY_PORTS is absent.
+ *
+ * Credentials in the component form are URL-encoded automatically so passwords
+ * with special characters (e.g. "ZXyna0dCujR~t9v3j8") are safe.
+ *
+ * @returns {string[]} ordered, de-duplicated, validated proxy URLs
+ */
+function getProxyPool() {
+    const raw = [];
+
+    if (process.env.PROXY_URLS) {
+        for (const part of process.env.PROXY_URLS.split(/[\s,]+/)) {
+            if (part.trim()) raw.push(part.trim());
+        }
+    }
+
+    if (process.env.PROXY_URL && process.env.PROXY_URL.trim()) {
+        raw.push(process.env.PROXY_URL.trim());
+    }
+
+    const host = process.env.PROXY_HOST && process.env.PROXY_HOST.trim();
+    if (host) {
+        const scheme = (process.env.PROXY_PROTOCOL || 'http').trim().toLowerCase();
+        const user = process.env.PROXY_USERNAME;
+        const pass = process.env.PROXY_PASSWORD;
+        const auth = user ? `${encodeURIComponent(user)}:${encodeURIComponent(pass || '')}@` : '';
+        const ports = expandPorts(process.env.PROXY_PORTS);
+        if (ports.length) {
+            for (const port of ports) raw.push(`${scheme}://${auth}${host}:${port}`);
+        } else {
+            const port = (process.env.PROXY_PORT || '').trim();
+            raw.push(`${scheme}://${auth}${host}${port ? `:${port}` : ''}`);
+        }
+    }
+
+    const seen = new Set();
+    const pool = [];
+    for (const url of raw) {
+        try {
+            parseProxyUrl(url);
+        } catch (error) {
+            console.warn(`[proxy] Ignoring invalid pool entry: ${error.message}`);
+            continue;
+        }
+        const key = url.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        pool.push(url);
+    }
+    return pool;
+}
+
+/**
+ * Whether every session MUST leave through a proxy (no direct fallback).
+ * Controlled by PROXY_REQUIRED (1/true/yes/on|0/false/no/off). When unset, it
+ * defaults to true whenever at least one proxy is configured — so configuring a
+ * proxy pool automatically forbids direct connections.
+ * @param {string[]} [pool]
+ * @returns {boolean}
+ */
+function isProxyRequired(pool) {
+    const explicit = process.env.PROXY_REQUIRED;
+    if (explicit !== undefined && explicit !== '') {
+        return /^(1|true|yes|on)$/i.test(explicit.trim());
+    }
+    const p = pool || getProxyPool();
+    return p.length > 0;
+}
+
+/**
+ * Resolve the gateway-wide default proxy (first entry of the pool).
+ * @returns {string|null}
+ */
+function getDefaultProxyUrl() {
+    return getProxyPool()[0] || null;
+}
+
+/**
  * Fetch PROXY_CHECK_URL through the proxy and report the egress IP.
  * @param {string} url - proxy URL
  * @returns {Promise<{ ok: boolean, ip?: string, latencyMs?: number, error?: string, proxy: string|null }>}
@@ -169,4 +281,14 @@ async function checkProxy(url) {
     }
 }
 
-module.exports = { parseProxyUrl, redactProxyUrl, buildProxyAgents, checkProxy, PROXY_CHECK_URL };
+module.exports = {
+    parseProxyUrl,
+    redactProxyUrl,
+    buildProxyAgents,
+    checkProxy,
+    getDefaultProxyUrl,
+    getProxyPool,
+    isProxyRequired,
+    expandPorts,
+    PROXY_CHECK_URL
+};

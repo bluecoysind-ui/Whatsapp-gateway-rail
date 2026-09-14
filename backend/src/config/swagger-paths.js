@@ -85,6 +85,75 @@
 
 /**
  * @swagger
+ * /api/whatsapp/qr:
+ *   get:
+ *     tags: [Sessions]
+ *     summary: Get pairing QR by username and phone number
+ *     description: |
+ *       Start (or reuse) a WhatsApp session for the given phone number and return
+ *       a base64 QR image plus its expiry timestamp. Query params:
+ *
+ *       - `username` — your user id, echoed back on the linked callback
+ *       - `phone_number` — digits only (also accepted as `phoneNumber`)
+ *
+ *       After the account is scanned and linked, the gateway POSTs to
+ *       `https://bluecoys.com/api/whatsapp-linked?phone_number=...` with
+ *       `{ phone_number, username, name }`. If that account later drops, a GET
+ *       is sent to `https://bluecoys.com/api/whatsapp-disconnected?phone_number=...`.
+ *     parameters:
+ *       - in: query
+ *         name: username
+ *         required: true
+ *         schema:
+ *           type: string
+ *         example: john
+ *       - in: query
+ *         name: phone_number
+ *         required: true
+ *         schema:
+ *           type: string
+ *         example: '919608079512'
+ *     responses:
+ *       200:
+ *         description: QR code ready, or session already connected
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 message:
+ *                   type: string
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     username:
+ *                       type: string
+ *                     phone_number:
+ *                       type: string
+ *                     sessionId:
+ *                       type: string
+ *                     qrCode:
+ *                       type: string
+ *                       description: Base64 PNG data URL (`data:image/png;base64,...`), or null if already connected
+ *                     qrExpiresAt:
+ *                       type: integer
+ *                       nullable: true
+ *                       description: Unix epoch milliseconds when this QR expires
+ *                     status:
+ *                       type: string
+ *                       example: qr_ready
+ *       400:
+ *         description: Missing username or phone_number
+ *       202:
+ *         description: QR not generated yet — retry
+ *       410:
+ *         description: QR expired — retry for a new one
+ */
+
+/**
+ * @swagger
  * /api/whatsapp/sessions:
  *   get:
  *     tags: [Sessions]

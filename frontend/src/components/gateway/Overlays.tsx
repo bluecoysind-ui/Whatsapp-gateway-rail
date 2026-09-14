@@ -436,10 +436,38 @@ export function ToolsPanel() {
                 </div>
                 <div className="min-w-0 flex-1">
                   <div className="truncate text-sm font-medium">{s.name || s.sessionId}</div>
-                  <div className="truncate text-xs text-muted">
-                    {s.phoneNumber || s.sessionId}
-                    {s.proxy ? <span className="ml-2 rounded-full border border-indigo/40 px-1.5 py-px text-[10px] text-indigo" title={s.proxy}>proxy</span> : null}
-                  </div>
+                  <div className="truncate text-xs text-muted">{s.phoneNumber || s.sessionId}</div>
+                  {s.proxyInfo?.active ? (
+                    <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[10px]">
+                      <span
+                        className={cn(
+                          "size-1.5 shrink-0 rounded-full",
+                          s.proxyInfo.connected ? "bg-indigo-300 shadow-[0_0_6px_#818cf8]" : "bg-white/30",
+                        )}
+                      />
+                      <span className={cn("font-medium", s.proxyInfo.connected ? "text-indigo-200" : "text-muted")}>
+                        {s.proxyInfo.connected ? "via" : "idle"}
+                      </span>
+                      <span className="truncate font-mono text-indigo-100" title={s.proxyInfo.active}>
+                        {s.proxyInfo.active}
+                      </span>
+                      {s.proxyInfo.source === "pool" && s.proxyInfo.poolSize > 0 ? (
+                        <span className="rounded-full border border-indigo/40 px-1.5 py-px text-indigo">
+                          pool {(s.proxyInfo.index ?? 0) + 1}/{s.proxyInfo.poolSize}
+                        </span>
+                      ) : (
+                        <span className="rounded-full border border-indigo/40 px-1.5 py-px text-indigo">
+                          {s.proxyInfo.source === "session" ? "session" : "single"}
+                        </span>
+                      )}
+                      {s.proxyInfo.required ? (
+                        <span className="rounded-full bg-emerald-500/15 px-1.5 py-px text-emerald-300">no direct</span>
+                      ) : null}
+                      {s.proxyInfo.rotations > 0 ? <span className="text-muted">· {s.proxyInfo.rotations}× rotated</span> : null}
+                    </div>
+                  ) : (
+                    <div className="mt-1 text-[10px] text-white/40">Direct connection (no proxy)</div>
+                  )}
                 </div>
                 <span className={cn("rounded-full px-2 py-0.5 text-[11px]", s.status === "connected" ? "bg-wa/15 text-wa" : "bg-danger/15 text-danger")}>
                   {s.status}

@@ -77,11 +77,27 @@ class BaileysStore {
     this._updateSingleChatOverview(resolvedId);
   }
 
-  _ingestHistoryContact(contact) {
+  /**
+   * Register the LID→phone identity carried on a contact record.
+   * Baileys v7 exposes the mapping two ways:
+   *   - id is a PN JID + a `lid` field, or
+   *   - id is a @lid + a `phoneNumber` field (the real phone JID).
+   * Wiring both up lets @lid chats/messages migrate to the real phone number.
+   */
+  _registerContactIdentity(contact) {
     if (!contact || !contact.id) return;
     if (contact.lid && !contact.id.endsWith('@lid')) {
       this.registerIdentity(contact.lid, contact.id);
     }
+    if (contact.id.endsWith('@lid') && contact.phoneNumber &&
+        (contact.phoneNumber.endsWith('@s.whatsapp.net') || contact.phoneNumber.endsWith('@c.us'))) {
+      this.registerIdentity(contact.id, contact.phoneNumber);
+    }
+  }
+
+  _ingestHistoryContact(contact) {
+    if (!contact || !contact.id) return;
+    this._registerContactIdentity(contact);
     let resolvedId = contact.id;
     if (contact.id.endsWith('@lid')) {
       const resolved = this.resolveIdentity(contact.id);
@@ -113,7 +129,10 @@ class BaileysStore {
       const resolved = this.resolveIdentity(msg.key.participant);
       if (resolved && resolved.jid) msg.key.participant = resolved.jid;
     }
-    if (msg.pushName && resolvedId && !resolvedId.endsWith('@lid') && !resolvedId.endsWith('@g.us')) {
+    // Persist pushName as the contact's display name for any non-group chat —
+    // including unresolved @lid chats, so the chat list shows a name instead of a
+    // raw LID even when the most recent message is outgoing (fromMe).
+    if (msg.pushName && resolvedId && !resolvedId.endsWith('@g.us')) {
       const existing = this.contacts.get(resolvedId) || {};
       if (!existing.notify || !existing.name) {
         this.contacts.set(resolvedId, { ...existing, id: resolvedId, notify: msg.pushName });
@@ -221,10 +240,8 @@ class BaileysStore {
     // Handle contact updates
     ev.on('contacts.set', ({ contacts }) => {
       for (const contact of contacts) {
-        // Register identity mapping when both PN JID and LID are known
-        if (contact.id && contact.lid && !contact.id.endsWith('@lid')) {
-          this.registerIdentity(contact.lid, contact.id);
-        }
+        // Register identity mapping from PN-JID+lid OR @lid+phoneNumber (v7)
+        this._registerContactIdentity(contact);
 
         // Resolve LID to JID before storing
         let resolvedId = contact.id;
@@ -245,10 +262,8 @@ class BaileysStore {
 
     ev.on('contacts.upsert', (contacts) => {
       for (const contact of contacts) {
-        // Register identity mapping when both PN JID and LID are known
-        if (contact.id && contact.lid && !contact.id.endsWith('@lid')) {
-          this.registerIdentity(contact.lid, contact.id);
-        }
+        // Register identity mapping from PN-JID+lid OR @lid+phoneNumber (v7)
+        this._registerContactIdentity(contact);
 
         // Resolve LID to JID before storing
         let resolvedId = contact.id;
@@ -329,8 +344,9 @@ class BaileysStore {
           }
         }
 
-        // Store pushName as contact notify if available
-        if (msg.pushName && resolvedId && !resolvedId.endsWith('@lid') && !resolvedId.endsWith('@g.us')) {
+        // Store pushName as contact notify (also for @lid chats) so the chat list
+        // shows a name instead of a raw LID even when the last message is outgoing.
+        if (msg.pushName && resolvedId && !resolvedId.endsWith('@g.us')) {
           const existing = this.contacts.get(resolvedId) || {};
           if (!existing.notify || !existing.name) {
             this.contacts.set(resolvedId, { ...existing, id: resolvedId, notify: msg.pushName });
@@ -374,8 +390,9 @@ class BaileysStore {
           }
         }
 
-        // Store pushName as contact notify if available
-        if (msg.pushName && resolvedId && !resolvedId.endsWith('@lid') && !resolvedId.endsWith('@g.us')) {
+        // Store pushName as contact notify (also for @lid chats) so the chat list
+        // shows a name instead of a raw LID even when the last message is outgoing.
+        if (msg.pushName && resolvedId && !resolvedId.endsWith('@g.us')) {
           const existing = this.contacts.get(resolvedId) || {};
           if (!existing.notify || !existing.name) {
             this.contacts.set(resolvedId, { ...existing, id: resolvedId, notify: msg.pushName });
@@ -496,6 +513,22 @@ class BaileysStore {
   }
 
   /**
+   * Find a usable display name from a chat's stored messages.
+   * Scans messages (newest first) for any incoming message that carries a
+   * pushName. This recovers a human-readable name for @lid/unnamed chats even
+   * when the most recent message is outgoing (fromMe carries no pushName).
+   */
+  _findPushName(chatId) {
+    const chatMessages = this.messages.get(chatId);
+    if (!chatMessages || chatMessages.size === 0) return null;
+    const messagesArray = Array.from(chatMessages.values())
+      .filter(m => m && m.key && !m.key.fromMe && m.pushName);
+    if (messagesArray.length === 0) return null;
+    messagesArray.sort((a, b) => toUnixSeconds(b.messageTimestamp) - toUnixSeconds(a.messageTimestamp));
+    return messagesArray[0].pushName || null;
+  }
+
+  /**
    * Update single chat overview (called on message events)
    */
   _updateSingleChatOverview(chatId, newMessage = null) {
@@ -535,16 +568,20 @@ class BaileysStore {
       // Groups: use group subject or chat name (never pushName — that's a person's name)
       chatName = groupMeta?.subject || chat?.name;
     } else {
-      // Personal chats: contact name → pushName → phone number
-      chatName = contact?.name || contact?.notify || latestMessage?.pushName || chat?.name;
+      // Personal chats: contact name → notify → verifiedName → pushName from the
+      // latest OR any earlier message → chat name (avoids raw LID/phone digits).
+      chatName = contact?.name || contact?.notify || contact?.verifiedName
+        || latestMessage?.pushName || this._findPushName(chatId) || chat?.name;
     }
     if (!chatName) {
-      chatName = chatId.split('@')[0]; // Strip any suffix (@s.whatsapp.net, @g.us, @lid)
+      // Fall back to the resolved phone number from the identity cache; only if that
+      // fails do we use the raw JID/local-id part.
+      chatName = this.resolvePhoneNumber(chatId) || chatId.split('@')[0];
     }
 
     this.chatsOverview.set(chatId, {
       id: chatId,
-      name: groupMeta?.subject || contact?.name || contact?.notify || chat?.name || chatId.split('@')[0],
+      name: chatName,
       isGroup,
       unreadCount: chat?.unreadCount || 0,
       lastMessage: {
@@ -777,9 +814,14 @@ class BaileysStore {
    * Safe JSON serialization (handles circular references and binary data)
    */
   _safeSerialize(data) {
-    const seen = new WeakSet();
-    
-    return JSON.stringify(data, (key, value) => {
+    // Track the ancestor chain (not every object ever seen) so that legitimately
+    // SHARED references — e.g. one lidMap mapping object stored under its lid, jid
+    // and phone keys — are serialized in full instead of being nulled out. A plain
+    // WeakSet of all seen objects wrongly treats a DAG as circular, which used to
+    // corrupt lidMap entries into `null` and break LID→phone resolution on reload.
+    const stack = [];
+
+    return JSON.stringify(data, function (key, value) {
       // Skip binary data and buffers
       if (value instanceof Uint8Array || value instanceof ArrayBuffer) {
         return undefined;
@@ -787,20 +829,24 @@ class BaileysStore {
       if (Buffer.isBuffer && Buffer.isBuffer(value)) {
         return undefined;
       }
-      
+
       // Skip functions
       if (typeof value === 'function') {
         return undefined;
       }
-      
-      // Handle circular references
+
       if (typeof value === 'object' && value !== null) {
-        if (seen.has(value)) {
-          return undefined;
+        // `this` is the holder currently being serialized. Pop ancestors we have
+        // finished with, then only reject `value` if it is a true ancestor (cycle).
+        while (stack.length > 0 && stack[stack.length - 1] !== this) {
+          stack.pop();
         }
-        seen.add(value);
+        if (stack.includes(value)) {
+          return undefined; // real circular reference
+        }
+        stack.push(value);
       }
-      
+
       return value;
     }, 2);
   }
@@ -922,6 +968,13 @@ class BaileysStore {
         if (contact.id && contact.lid && !contact.id.endsWith('@lid')) {
           identityPairs.push({ lid: contact.lid, jid: contact.id });
         }
+        // Baileys v7 keys @lid contacts with the real phone JID in `phoneNumber`.
+        // This is what lets @lid chats resolve to a number on restore.
+        const pn = contact.phoneNumber;
+        if (contact.id && contact.id.endsWith('@lid') && pn &&
+            (pn.endsWith('@s.whatsapp.net') || pn.endsWith('@c.us'))) {
+          identityPairs.push({ lid: contact.id, jid: pn });
+        }
       }
 
       // Also reconstruct lidMap from remoteJidAlt in stored messages (Baileys v7)
@@ -932,11 +985,19 @@ class BaileysStore {
           if (msg.key.remoteJid && msg.key.remoteJid.endsWith('@lid') && altJid && altJid.endsWith('@s.whatsapp.net')) {
             identityPairs.push({ lid: msg.key.remoteJid, jid: altJid });
           }
-          // Extract pushName into contacts
-          if (msg.pushName && altJid && altJid.endsWith('@s.whatsapp.net')) {
-            const existing = this.contacts.get(altJid) || {};
-            if (!existing.notify && !existing.name) {
-              this.contacts.set(altJid, { ...existing, id: altJid, notify: msg.pushName });
+          // Extract pushName into contacts. Prefer the resolved PN JID (altJid),
+          // but for chats that are still keyed by @lid store it under the LID so
+          // the chat list shows a name instead of the raw LID digits.
+          if (msg.pushName && !msg.key.fromMe) {
+            const contactKey =
+              (altJid && altJid.endsWith('@s.whatsapp.net')) ? altJid :
+              (msg.key.remoteJid && !msg.key.remoteJid.endsWith('@g.us')) ? msg.key.remoteJid :
+              null;
+            if (contactKey) {
+              const existing = this.contacts.get(contactKey) || {};
+              if (!existing.notify && !existing.name) {
+                this.contacts.set(contactKey, { ...existing, id: contactKey, notify: msg.pushName });
+              }
             }
           }
         }
@@ -1197,15 +1258,25 @@ class BaileysStore {
       }
     }
     
-    // 4. Migrate chatsOverview
+    // 4. Migrate chatsOverview and recompute the display name from the resolved contact
     if (this.chatsOverview.has(normalizedLid)) {
       const overview = this.chatsOverview.get(normalizedLid);
       this.chatsOverview.delete(normalizedLid);
       overview.id = normalizedJid;
+      const contact = this.contacts.get(normalizedJid);
+      const phone = normalizedJid.split('@')[0];
+      overview.name = contact?.name || contact?.notify || phone;
       this.chatsOverview.set(normalizedJid, overview);
     }
-    
-    // 5. Invalidate caches to force rebuild
+
+    // 5. Migrate profile pictures so the resolved JID shows the cached avatar
+    if (this.profilePictures.has(normalizedLid)) {
+      const pic = this.profilePictures.get(normalizedLid);
+      this.profilePictures.delete(normalizedLid);
+      this.profilePictures.set(normalizedJid, pic);
+    }
+
+    // 6. Invalidate sorted caches so the next read uses the migrated data
     this._invalidateOverviewCache();
     this._invalidateContactsCache();
   }
@@ -1215,10 +1286,26 @@ class BaileysStore {
    * Called after readFromFile to clean up persisted LID keys.
    */
   _resolveAllLidKeys() {
+    // Repair legacy stores where the serializer nulled out the shared jid/phone
+    // keys of lidMap (see _safeSerialize). Rebuild them from the intact @lid
+    // entries so reverse lookups (jid/phone → identity) work again.
+    for (const [key, mapping] of Array.from(this.lidMap.entries())) {
+      if (key.endsWith('@lid') && mapping && mapping.jid) {
+        if (mapping.jid && !this.lidMap.get(mapping.jid)) this.lidMap.set(mapping.jid, mapping);
+        if (mapping.pn && !this.lidMap.get(mapping.pn)) this.lidMap.set(mapping.pn, mapping);
+      }
+    }
+
+    // Drop any remaining null/invalid entries so later iterations never crash.
+    for (const [key, mapping] of Array.from(this.lidMap.entries())) {
+      if (!mapping || typeof mapping !== 'object') this.lidMap.delete(key);
+    }
+
     // Collect all known LID→JID mappings from lidMap
     const migrations = new Map();
     for (const [key, mapping] of this.lidMap.entries()) {
-      if (key.endsWith('@lid') && mapping.jid && !mapping.jid.endsWith('@lid')) {
+      // Guard against null entries from older corrupted stores.
+      if (key.endsWith('@lid') && mapping && mapping.jid && !mapping.jid.endsWith('@lid')) {
         migrations.set(key, mapping.jid);
       }
     }
@@ -1295,11 +1382,14 @@ class BaileysStore {
     if (resolved && resolved.pn) {
       return resolved.pn;
     }
-    // Fallback: if it's a PN JID (ends with @s.whatsapp.net), split to get the phone number
-    if (jid.endsWith('@s.whatsapp.net')) {
+    // Fallback: if it's a phone-number JID, split to get the phone number.
+    // Baileys keys personal chats by @s.whatsapp.net (v7) or @c.us (normalized/legacy).
+    if (jid.endsWith('@s.whatsapp.net') || jid.endsWith('@c.us')) {
       return jid.split('@')[0];
     }
-    return jid; // could be group ID or LID
+    // For any other JID (group @g.us or unresolved @lid) never expose the raw
+    // domain suffix in the UI — return just the local part.
+    return jid.includes('@') ? jid.split('@')[0] : jid;
   }
 }
 

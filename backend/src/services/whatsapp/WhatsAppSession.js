@@ -8,6 +8,7 @@ const BaileysStore = require('./BaileysStore');
 const MessageFormatter = require('./MessageFormatter');
 const wsManager = require('../websocket/WebSocketManager');
 const { buildProxyAgents, redactProxyUrl } = require('./proxy');
+const proxyManager = require('./ProxyManager');
 const sessionEvents = require('./sessionEvents');
 
 const QR_EXPIRY_MS = Number(process.env.QR_EXPIRY_MS) || 120_000;
@@ -38,16 +39,39 @@ class WhatsAppSession {
         // True once the auth creds are paired/registered. A registered session must
         // NEVER be treated as an expired QR (that would delete its whole folder).
         this.registered = false;
+        // Set when a QR is shown; consumed on the next 'open' so the linked
+        // callback fires for a fresh pair, not for later reconnects.
+        this._pendingLink = false;
 
         // Custom metadata and webhook
         this.metadata = options.metadata || {};
         this.webhooks = options.webhooks || []; // Array of { url, events? }
         this.proxy = options.proxy || null;
+        // The proxy actually used by the live socket (explicit or pool-assigned).
+        this.activeProxy = null;
+        // Consecutive connection failures since the last successful 'open'.
+        this._proxyFailures = 0;
+        // Debounce: earliest time we may rotate the proxy again (ms epoch).
+        this._nextProxyRotateAt = 0;
+        // Guard against overlapping connect() calls creating two sockets on the
+        // same credentials (WhatsApp answers that with a "conflict" disconnect).
+        this._connecting = false;
+        // Single pending reconnect timer so close events can't stack many.
+        this._reconnectTimer = null;
         // messageId -> /media/... path for media we sent from a local file.
         this._pendingMediaPaths = new Map();
 
-        // Load config if exists
+        // USync batch cooldown: no directory queries until this timestamp.
+        this._usyncCooldownUntil = 0;
+
+        // Load config if exists, then let constructor options win so a new
+        // connect (e.g. QR link with username) is not overwritten by a stale file.
         this._loadConfig();
+        if (options.metadata) {
+            this.metadata = { ...this.metadata, ...options.metadata };
+        }
+        if (options.webhooks) this.webhooks = options.webhooks;
+        if (options.proxy !== undefined) this.proxy = options.proxy || null;
     }
 
     /**
@@ -173,7 +197,46 @@ class WhatsAppSession {
 
     // ==================== CONNECTION ====================
 
+    /**
+     * Fully drop the current socket: remove all listeners and end the underlying
+     * WebSocket so it can never linger and "conflict" with a fresh connection.
+     */
+    _teardownSocket() {
+        if (!this.socket) return;
+        try {
+            this.socket.ev.removeAllListeners();
+        } catch {
+            /* already gone */
+        }
+        try {
+            this.socket.end(undefined);
+        } catch {
+            /* already closed */
+        }
+        this.socket = null;
+    }
+
     async connect() {
+        // A pending reconnect is now superseded by this explicit attempt.
+        clearTimeout(this._reconnectTimer);
+        this._reconnectTimer = null;
+
+        // Never run two connection attempts / two sockets for one account at once.
+        // WhatsApp resolves duplicate sockets on the same creds with a "conflict"
+        // (connectionReplaced) disconnect, which otherwise loops forever.
+        if (this._connecting) {
+            console.log(`[${this.sessionId}] connect() ignored — an attempt is already in progress`);
+            return { success: false, message: 'Connection already in progress' };
+        }
+        if (this.socket && (this.connectionStatus === 'connected' || this.connectionStatus === 'connecting')) {
+            console.log(`[${this.sessionId}] connect() ignored — socket already ${this.connectionStatus}`);
+            return { success: false, message: `Already ${this.connectionStatus}` };
+        }
+
+        // Drop any lingering (dead) socket before creating a new one.
+        this._teardownSocket();
+
+        this._connecting = true;
         try {
             this._clearQrTimer();
             this.qrExpired = false;
@@ -208,16 +271,51 @@ class WhatsAppSession {
                 }
             }, 30_000);
 
+            // Decide the egress proxy and whether direct connection is forbidden.
+            //   - An explicit per-session proxy (this.proxy) always wins and is sticky.
+            //   - Otherwise the account is assigned one from the rotating pool.
+            //   - `proxyRequired` means: never connect directly — if no proxy can be
+            //     built we back off and retry instead of falling through to a raw link.
+            const usingPool = !this.proxy && proxyManager.size() > 0;
+            let effectiveProxy = this.proxy || (usingPool ? proxyManager.current(this.sessionId) : null);
+            const proxyRequired = this.proxy ? true : (proxyManager.size() > 0 && proxyManager.isRequired());
+
             let proxyAgents = null;
-            if (this.proxy) {
-                try {
-                    proxyAgents = buildProxyAgents(this.proxy);
-                    console.log(`[${this.sessionId}] Connecting through proxy ${redactProxyUrl(this.proxy)}`);
-                } catch (error) {
-                    this.connectionStatus = 'error';
-                    console.error(`[${this.sessionId}] Invalid proxy, not connecting:`, error.message);
-                    return { success: false, message: `Invalid proxy: ${error.message}` };
+            if (effectiveProxy) {
+                // Try to build agents; for pool proxies, rotate through the ring if an
+                // entry is unusable so one bad proxy can't strand the account.
+                const maxAttempts = usingPool ? Math.max(1, proxyManager.size()) : 1;
+                for (let attempt = 0; attempt < maxAttempts; attempt++) {
+                    try {
+                        proxyAgents = buildProxyAgents(effectiveProxy);
+                        break;
+                    } catch (error) {
+                        console.error(`[${this.sessionId}] Unusable proxy ${redactProxyUrl(effectiveProxy)}: ${error.message}`);
+                        if (!usingPool) break;
+                        effectiveProxy = proxyManager.rotate(this.sessionId, `build failed: ${error.message}`);
+                    }
                 }
+            }
+
+            if (!proxyAgents && proxyRequired) {
+                // Enforcement: no usable proxy AND direct connection is disabled.
+                // Do NOT create a socket — back off and retry so the account keeps
+                // trying to come up through a proxy rather than leaking direct.
+                this.connectionStatus = 'error';
+                this.activeProxy = null;
+                const msg = 'No usable proxy available and direct connection is disabled';
+                console.error(`[${this.sessionId}] ${msg} — retrying in 15s`);
+                wsManager.emitSessionStatus(this.sessionId, 'error', { reason: msg });
+                this._sendWebhook('connection.update', { status: 'error', reason: msg });
+                clearTimeout(this._proxyRetryTimer);
+                this._proxyRetryTimer = setTimeout(() => this.connect(), 15_000);
+                return { success: false, message: msg };
+            }
+
+            this.activeProxy = proxyAgents ? effectiveProxy : null;
+            if (proxyAgents) {
+                const source = this.proxy ? 'session' : 'pool';
+                console.log(`[${this.sessionId}] Connecting through proxy ${redactProxyUrl(effectiveProxy)} (${source})`);
             }
 
             const { state, saveCreds } = await useMultiFileAuthState(this.authFolder);
@@ -244,6 +342,10 @@ class WhatsAppSession {
             console.error(`[${this.sessionId}] Error connecting:`, error);
             this.connectionStatus = 'error';
             return { success: false, message: error.message };
+        } finally {
+            // The socket now owns its lifecycle via connection.update events;
+            // release the re-entrancy guard so future reconnects can proceed.
+            this._connecting = false;
         }
     }
 
@@ -291,6 +393,7 @@ class WhatsAppSession {
         if (this.connectionStatus === 'qr_expired') return;
         this._clearQrTimer();
         this.qrExpired = false;
+        this._pendingLink = false;
         this.connectionStatus = 'qr_expired';
         this.qrCode = null;
         console.log(`[${this.sessionId}] QR login expired (${reason}) - session revoked.`);
@@ -315,13 +418,13 @@ class WhatsAppSession {
             if (qr) {
                 this.qrCode = await qrcode.toDataURL(qr);
                 this.connectionStatus = 'qr_ready';
+                this._pendingLink = true;
                 console.log(`📱 [${this.sessionId}] QR Code generated! Scan dengan WhatsApp Anda.`);
 
                 // Emit QR code to WebSocket
+                this._startQrExpiryTimer();
                 wsManager.emitQRCode(this.sessionId, this.qrCode);
                 wsManager.emitSessionStatus(this.sessionId, 'qr_ready', { qrExpiresAt: this.qrExpiresAt });
-
-                this._startQrExpiryTimer();
             }
 
             if (connection === 'close') {
@@ -364,6 +467,7 @@ class WhatsAppSession {
                         sessionId: this.sessionId,
                         phoneNumber: this.phoneNumber,
                         name: this.name,
+                        username: this.metadata?.username || null,
                         reason: reason || null,
                         loggedOut: !shouldReconnect,
                         willReconnect: shouldReconnect
@@ -376,8 +480,32 @@ class WhatsAppSession {
                 });
 
                 if (shouldReconnect) {
+                    // Rotate the egress proxy when the drop looks like a rate limit,
+                    // or after repeated failures, so no account stays pinned to a bad IP.
+                    this._proxyFailures++;
+                    if (!this.proxy && proxyManager.size() > 1) {
+                        const rateLimited = this._looksRateLimited(reason, statusCode);
+                        if (rateLimited || this._proxyFailures >= 3) {
+                            const next = proxyManager.rotate(this.sessionId, reason || `status ${statusCode}`);
+                            this.activeProxy = next;
+                            this._proxyFailures = 0;
+                            console.log(
+                                `[${this.sessionId}] Rotating proxy ` +
+                                `(${rateLimited ? 'rate limit' : 'repeated failures'}) → ${redactProxyUrl(next)}`
+                            );
+                            wsManager.emitSessionStatus(this.sessionId, 'disconnected', {
+                                proxyRotated: true,
+                                proxy: redactProxyUrl(next),
+                                reason: reason || null
+                            });
+                        }
+                    }
                     console.log(`[${this.sessionId}] Reconnecting...`);
-                    setTimeout(() => this.connect(), 5000);
+                    // Drop the dead socket and schedule a single reconnect so
+                    // overlapping close events can't spawn duplicate sockets.
+                    this._teardownSocket();
+                    clearTimeout(this._reconnectTimer);
+                    this._reconnectTimer = setTimeout(() => this.connect(), 5000);
                 } else {
                     console.log(`[${this.sessionId}] Logged out.`);
                     wsManager.emitLoggedOut(this.sessionId);
@@ -386,6 +514,9 @@ class WhatsAppSession {
             } else if (connection === 'open') {
                 this._clearQrTimer();
                 this.qrExpired = false;
+                this._proxyFailures = 0; // healthy again — reset the rotation counter
+                const justLinked = this._pendingLink;
+                this._pendingLink = false;
                 console.log(`[${this.sessionId}] WhatsApp Connected Successfully!`);
                 this.connectionStatus = 'connected';
                 this.qrCode = null;
@@ -418,9 +549,15 @@ class WhatsAppSession {
                     name: this.name
                 });
 
-                // Explicit lifecycle event
+                // Explicit lifecycle event (linked callback only on a fresh QR pair)
                 sessionEvents.onSessionConnected(
-                    { sessionId: this.sessionId, phoneNumber: this.phoneNumber, name: this.name },
+                    {
+                        sessionId: this.sessionId,
+                        phoneNumber: this.phoneNumber,
+                        name: this.name,
+                        username: this.metadata?.username || null,
+                        justLinked
+                    },
                     { sendWebhook: (event, data) => this._sendWebhook(event, data) }
                 );
                 wsManager.emitSessionStatus(this.sessionId, 'connected', { phoneNumber: this.phoneNumber, name: this.name });
@@ -621,6 +758,12 @@ class WhatsAppSession {
     }
 
     getInfo() {
+        const explicit = Boolean(this.proxy);
+        const pm = proxyManager.info(this.sessionId);
+        // The proxy the account actually connects through: the live one if up,
+        // otherwise the explicit config or the account's current pool assignment.
+        const activeUrl = this.activeProxy || this.proxy || (explicit ? this.proxy : pm.url);
+        const required = explicit ? true : (pm.poolSize > 0 && pm.required);
         return {
             sessionId: this.sessionId,
             status: this.connectionStatus,
@@ -632,7 +775,18 @@ class WhatsAppSession {
             storeStats: this.store ? this.store.getStats() : null,
             metadata: this.metadata,
             webhooks: this.webhooks,
-            proxy: redactProxyUrl(this.proxy),
+            proxy: redactProxyUrl(activeUrl),
+            proxyInfo: {
+                active: redactProxyUrl(activeUrl),
+                connected: this.connectionStatus === 'connected' && Boolean(this.activeProxy),
+                source: explicit ? 'session' : (pm.poolSize > 0 ? 'pool' : 'none'),
+                required,
+                poolSize: pm.poolSize,
+                index: explicit ? null : pm.index,
+                rotations: explicit ? 0 : pm.rotations,
+                rotatedAt: explicit ? null : pm.rotatedAt,
+                lastReason: explicit ? null : pm.lastReason
+            },
             sync: this.store ? this.store.syncState : null
         };
     }
@@ -640,6 +794,9 @@ class WhatsAppSession {
     async logout() {
         try {
             this._clearQrTimer();
+            clearTimeout(this._proxyRetryTimer);
+            clearTimeout(this._reconnectTimer);
+            this._reconnectTimer = null;
             if (this.storeInterval) {
                 clearInterval(this.storeInterval);
             }
@@ -657,6 +814,8 @@ class WhatsAppSession {
                 this.socket = null;
             }
             this.deleteAuthFolder();
+            proxyManager.release(this.sessionId); // free the pool assignment
+            this.activeProxy = null;
             this.connectionStatus = 'disconnected';
             this.qrCode = null;
             this.phoneNumber = null;
@@ -778,8 +937,137 @@ class WhatsAppSession {
         return chatId.includes('@g.us');
     }
 
-    async resolveLidFromServer(lid) {
+    /**
+     * Normalize a phone JID to the @c.us suffix used throughout the gateway.
+     */
+    normalizePhoneJid(jid) {
+        if (!jid) return jid;
+        if (jid.endsWith('@s.whatsapp.net')) {
+            return `${jid.split('@')[0]}@c.us`;
+        }
+        return jid;
+    }
+
+    /**
+     * Extract a bare phone number (digits only) from any phone representation:
+     * a full PN JID ("919876543210@s.whatsapp.net"), a device-specific JID
+     * ("919876543210:3@s.whatsapp.net"), or already-bare digits ("919876543210").
+     * Returns null for LID JIDs or anything without real digits.
+     */
+    _extractPhoneDigits(value) {
+        if (value == null) return null;
+        const str = String(value);
+        // A LID is not a phone number — never treat it as one.
+        if (str.endsWith('@lid') || str.endsWith('@hosted.lid')) return null;
+        const digits = str.split('@')[0].split(':')[0].replace(/\D/g, '');
+        return digits.length ? digits : null;
+    }
+
+    /**
+     * Parse a device-specific PN JID (e.g. "628123456789:0@s.whatsapp.net") into
+     * a clean phone number and a normalized @c.us JID.
+     */
+    _parsePnJid(pnJid) {
+        if (!pnJid) return null;
+        const userPart = pnJid.split('@')[0];
+        if (!userPart) return null;
+        const phone = userPart.split(':')[0];
+        if (!phone || !/^\d+$/.test(phone)) return null;
+        const jid = `${phone}@c.us`;
+        return { jid, pn: phone };
+    }
+
+    /**
+     * Heuristic: does this disconnect reason / status look like WhatsApp rate
+     * limiting the current egress IP? Used to trigger proxy rotation.
+     */
+    _looksRateLimited(reason, statusCode) {
+        const RATE_LIMIT_STATUS = new Set([408, 429, 503]);
+        if (RATE_LIMIT_STATUS.has(Number(statusCode))) return true;
+        return /rate.?over.?limit|rate.?limit|over.?limit|too.?many|429|throttl/i.test(String(reason || ''));
+    }
+
+    /**
+     * Called when a network operation (e.g. USync LID resolution) is rate-limited.
+     * Rotates this account onto a fresh proxy and reconnects so subsequent queries
+     * leave through a different IP. Debounced and only when a pool is available.
+     */
+    _maybeRotateOnRateLimit(reason = 'rate-overlimit') {
+        if (this.proxy || proxyManager.size() <= 1) return; // sticky/explicit or nothing to rotate to
+        const now = Date.now();
+        if (now < this._nextProxyRotateAt) return; // debounce back-to-back rotations
+        this._nextProxyRotateAt = now + 60_000;
+        const next = proxyManager.rotate(this.sessionId, reason);
+        this.activeProxy = next;
+        console.log(`[${this.sessionId}] Rotating proxy after ${reason} → ${redactProxyUrl(next)}; reconnecting`);
+        wsManager.emitSessionStatus(this.sessionId, this.connectionStatus, {
+            proxyRotated: true,
+            proxy: redactProxyUrl(next),
+            reason
+        });
+        // Soft reconnect so the new proxy applies to future socket traffic.
+        this.restart(`proxy rotation after ${reason}`).catch(() => {});
+    }
+
+    // USync directory queries are rate-limited by WhatsApp. We therefore resolve
+    // LIDs in ONE batched query per request (and only after a failure-backoff,
+    // or we keep re-hitting `rate-overlimit` and never resolve anything).
+    //
+    // Resolution order for every LID:
+    //   1. Gateway's own in-memory lidMap cache (no network)
+    //   2. Baileys' persistent LID-PN mapping store (no network)
+    //   3. ONE batched USync query for whatever is still unmapped
+
+    /** Resolve one LID without network access (cache + signal repository only). */
+    async _resolveLidLocally(lid) {
         if (!lid || !lid.endsWith('@lid') || !this.socket) return null;
+        const lowerLid = lid.toLowerCase();
+
+        // 1. Gateway cache
+        const cached = this.store?.resolveIdentity(lowerLid);
+        if (cached?.jid) {
+            const parsed = this._parsePnJid(this.normalizePhoneJid(cached.jid));
+            if (parsed) return parsed;
+        }
+
+        // 2. Baileys' persistent LID mapping store (populated by message/group traffic)
+        const signalMapping = this.socket.signalRepository?.lidMapping;
+        if (signalMapping?.getPNForLID) {
+            try {
+                const pnJid = await signalMapping.getPNForLID(lowerLid);
+                const parsed = this._parsePnJid(pnJid);
+                if (parsed) {
+                    this.store?.registerIdentity(lowerLid, parsed.jid);
+                    return parsed;
+                }
+            } catch (e) {
+                // ignore
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Resolve many LIDs with ONE batched USync query.
+     * Local sources are checked first; only unmapped LIDs go over the wire.
+     * Returns a Map of lid -> { jid, pn }.
+     */
+    async _resolveLidsBatch(lids) {
+        const out = new Map();
+        if (!lids.length || !this.socket) return out;
+
+        const leftovers = [];
+        for (const lid of lids) {
+            const local = await this._resolveLidLocally(lid);
+            if (local) out.set(lid.toLowerCase(), local);
+            else leftovers.push(lid.toLowerCase());
+        }
+        if (leftovers.length === 0) return out;
+
+        // Cool down after a failed/rate-limited batch: a repeat request inside the
+        // window is what triggers `rate-overlimit` and keeps everything unresolved.
+        const now = Date.now();
+        if (now < this._usyncCooldownUntil) return out;
 
         try {
             const { USyncQuery, USyncUser } = require('@whiskeysockets/baileys');
@@ -788,31 +1076,126 @@ class WhatsAppSession {
                 .withDeviceProtocol()
                 .withLIDProtocol();
 
-            query.withUser(new USyncUser().withId(lid));
+            // All LIDs go into a single directory request.
+            for (const lid of leftovers) query.withUser(new USyncUser().withId(lid));
 
             const result = await this.socket.executeUSyncQuery(query);
             if (result && result.list) {
                 for (const item of result.list) {
-                    if (item.lid && item.id) {
-                        const lidJid = item.lid.toLowerCase();
-                        const pnJid = item.id.toLowerCase();
-                        if (this.store) {
-                            this.store.registerIdentity(lidJid, pnJid);
-                        }
-                        if (lidJid === lid.toLowerCase()) {
-                            return {
-                                lid: lidJid,
-                                jid: pnJid,
-                                pn: pnJid.split('@')[0]
-                            };
-                        }
-                    }
+                    if (!item.lid || !item.id) continue;
+                    const lidJid = item.lid.toLowerCase();
+                    const pnJid = item.id.toLowerCase();
+                    this.store?.registerIdentity(lidJid, pnJid);
+                    const parsed = this._parsePnJid(this.normalizePhoneJid(pnJid));
+                    if (parsed) out.set(lidJid, parsed);
                 }
             }
         } catch (error) {
-            console.error(`[${this.sessionId}] Error resolving LID from server:`, error.message);
+            // rate-overlimit / timeout — back off for a while so the UI doesn't spam.
+            this._usyncCooldownUntil = Date.now() + 30_000;
+            console.error(`[${this.sessionId}] Batch LID resolution failed (cooling down for 30s):`, error.message);
+            // If WhatsApp is throttling this egress IP, move the account to a fresh
+            // proxy so the next round of directory lookups can actually succeed.
+            if (this._looksRateLimited(error.message)) {
+                this._maybeRotateOnRateLimit('LID resolve rate-overlimit');
+            }
         }
-        return null;
+        return out;
+    }
+
+    /** Single-LID convenience wrapper around _resolveLidsBatch. */
+    async _resolveLidToPhone(lid) {
+        const out = await this._resolveLidsBatch([lid]);
+        return out.get(lid?.toLowerCase()) || null;
+    }
+
+    /**
+     * Send a message and record the LID↔phone identity for the recipient.
+     *
+     * ROOT FIX for outbound-only chats: this gateway sends to phone numbers, but
+     * WhatsApp v7 keys the resulting chat/messages by the recipient's @lid. Unless
+     * we capture the mapping at send time, that chat can only ever display the raw
+     * LID (there is no phone number anywhere in the stored outbound message).
+     * Here we always know the phone JID we sent to, so we bind it to the LID that
+     * Baileys used — both from the send result and from the signal LID store.
+     */
+    async _sendAndTrack(jid, content, options) {
+        const result = await this.socket.sendMessage(jid, content, options);
+        try { this._recordSentIdentity(jid, result); } catch (_) { /* non-fatal */ }
+        // Debounced re-sweep: applies any newly-learned LID↔phone mappings to
+        // still-pending legacy @lid chats and refreshes the chat list.
+        this._scheduleLidResweep();
+        return result;
+    }
+
+    /** Debounced background re-run of LID resolution after send activity. */
+    _scheduleLidResweep() {
+        clearTimeout(this._lidResweepTimer);
+        this._lidResweepTimer = setTimeout(() => {
+            this._resolvePendingLids().catch(() => {});
+        }, 4000);
+    }
+
+    _recordSentIdentity(jid, result) {
+        if (!this.store || !jid) return;
+        // Only phone-number recipients carry a resolvable identity (skip groups).
+        if (jid.endsWith('@g.us') || jid.endsWith('@lid')) return;
+        const pnJid = this.normalizePhoneJid(jid); // canonical @c.us form
+
+        // 1. The send result itself may be keyed by the recipient's LID.
+        const rjid = result?.key?.remoteJid;
+        const ralt = result?.key?.remoteJidAlt;
+        if (rjid && rjid.endsWith('@lid')) {
+            this.store.registerIdentity(rjid, pnJid);
+        }
+        if (ralt && ralt.endsWith('@lid')) {
+            this.store.registerIdentity(ralt, pnJid);
+        }
+
+        // 2. Ask Baileys' signal LID store for the LID it used for this phone and
+        //    bind that too, so the chat (keyed by LID) resolves to the number.
+        const lidMapping = this.socket?.signalRepository?.lidMapping;
+        if (lidMapping?.getLIDForPN) {
+            Promise.resolve()
+                .then(() => lidMapping.getLIDForPN(pnJid))
+                .then((lid) => {
+                    if (lid && String(lid).endsWith('@lid')) {
+                        this.store.registerIdentity(String(lid).toLowerCase(), pnJid);
+                        this.store._invalidateOverviewCache?.();
+                    }
+                })
+                .catch(() => {});
+        }
+    }
+
+    /**
+     * Resolve a chat identifier to a stable JID and phone number.
+     * Local sources only — the batched resolution happens in `_resolveLidsBatch`.
+     */
+    async _resolveChatIdentity(chatId) {
+        if (!chatId) return { id: chatId, phone: null, isGroup: false };
+        if (this.isGroupJid(chatId)) return { id: chatId, phone: null, isGroup: true };
+
+        if (chatId.endsWith('@lid')) {
+            const resolved = await this._resolveLidLocally(chatId);
+            if (resolved) return { id: resolved.jid, phone: resolved.pn, isGroup: false };
+            return { id: chatId, phone: null, isGroup: false };
+        }
+
+        // Already a phone JID: just normalize the suffix
+        if (chatId.endsWith('@s.whatsapp.net') || chatId.endsWith('@c.us')) {
+            const normalized = this.normalizePhoneJid(chatId);
+            return { id: normalized, phone: normalized.split('@')[0], isGroup: false };
+        }
+
+        return { id: chatId, phone: null, isGroup: false };
+    }
+
+    async resolveLidFromServer(lid) {
+        // Kept for backward compatibility.
+        const parsed = await this._resolveLidToPhone(lid);
+        if (!parsed) return null;
+        return { lid: lid.toLowerCase(), jid: parsed.jid, pn: parsed.pn };
     }
 
     /**
@@ -822,6 +1205,13 @@ class WhatsAppSession {
      */
     async _resolvePendingLids(max = 80) {
         if (!this.store || !this.socket || this.connectionStatus !== 'connected') return;
+
+        // STEP 0 (no network): build LID→phone mappings from Baileys' signal LID
+        // store using every phone number we already know. Outbound-only chats have
+        // no phone data locally, but the signal store often already knows the LID
+        // for a phone we've messaged — this resolves them without any USync query.
+        const reverseResolved = await this._resolveLidsFromSignalStore();
+
         const pending = new Set();
         const collect = (id) => {
             if (id && id.endsWith('@lid') && !this.store.resolveIdentity(id)) pending.add(id);
@@ -830,22 +1220,61 @@ class WhatsAppSession {
         for (const id of this.store.chats.keys()) collect(id);
         for (const id of this.store.contacts.keys()) collect(id);
         const lids = [...pending].slice(0, max);
-        if (lids.length === 0) return;
-        console.log(`[${this.sessionId}] resolving ${lids.length} LID mapping(s)...`);
-        let resolved = 0;
-        for (const lid of lids) {
-            if (this.connectionStatus !== 'connected') break;
-            try {
-                const r = await this.resolveLidFromServer(lid);
-                if (r) resolved++;
-            } catch (e) { /* skip bad LID */ }
-            await new Promise((r) => setTimeout(r, 120));
+        if (lids.length === 0) {
+            if (reverseResolved > 0) {
+                this.store._invalidateOverviewCache?.();
+                this.store._invalidateContactsCache?.();
+            }
+            return;
         }
+        console.log(`[${this.sessionId}] resolving ${lids.length} LID mapping(s)...`);
+        // ONE batched USync query (plus local sources) instead of N individual queries.
+        const batch = await this._resolveLidsBatch(lids);
+        const resolved = batch.size + reverseResolved;
         if (resolved > 0) {
             this.store._invalidateOverviewCache?.();
             this.store._invalidateContactsCache?.();
             console.log(`[${this.sessionId}] resolved ${resolved}/${lids.length} LID mapping(s)`);
         }
+    }
+
+    /**
+     * Populate LID→phone mappings from Baileys' persistent signal LID store using
+     * the phone numbers we already have (contacts + phone-keyed chats). No network.
+     * Returns the number of new mappings registered.
+     */
+    async _resolveLidsFromSignalStore() {
+        const lidMapping = this.socket?.signalRepository?.lidMapping;
+        if (!lidMapping?.getLIDForPN) return 0;
+
+        // Collect candidate phone JIDs from contacts and phone-keyed chats/messages.
+        const phoneJids = new Set();
+        const addIfPhone = (id) => {
+            if (id && (id.endsWith('@s.whatsapp.net') || id.endsWith('@c.us'))) {
+                phoneJids.add(id);
+            }
+        };
+        for (const id of this.store.contacts.keys()) addIfPhone(id);
+        for (const id of this.store.chats.keys()) addIfPhone(id);
+        for (const id of this.store.messages.keys()) addIfPhone(id);
+
+        let count = 0;
+        for (const pnJid of phoneJids) {
+            try {
+                const lid = await lidMapping.getLIDForPN(pnJid);
+                if (lid && String(lid).endsWith('@lid')) {
+                    const lowerLid = String(lid).toLowerCase();
+                    if (!this.store.resolveIdentity(lowerLid)) {
+                        this.store.registerIdentity(lowerLid, pnJid);
+                        count++;
+                    }
+                }
+            } catch (_) { /* ignore individual failures */ }
+        }
+        if (count > 0) {
+            console.log(`[${this.sessionId}] resolved ${count} LID mapping(s) from signal store`);
+        }
+        return count;
     }
 
     // ==================== SEND MESSAGES ====================
@@ -916,7 +1345,7 @@ class WhatsAppSession {
                 }
             }
 
-            const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
+            const result = await this._sendAndTrack(jid, messageContent, messageOptions);
 
             return {
                 success: true,
@@ -966,7 +1395,7 @@ class WhatsAppSession {
                 }
             }
 
-            const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
+            const result = await this._sendAndTrack(jid, messageContent, messageOptions);
             this._rememberOutgoingMedia(jid, result.key.id, imageUrl);
 
             return {
@@ -1019,7 +1448,7 @@ class WhatsAppSession {
                 }
             }
 
-            const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
+            const result = await this._sendAndTrack(jid, messageContent, messageOptions);
             this._rememberOutgoingMedia(jid, result.key.id, documentUrl);
 
             return {
@@ -1058,7 +1487,7 @@ class WhatsAppSession {
                     key: { remoteJid: jid, id: replyTo, fromMe: false }, message: { conversation: '' }
                 };
             }
-            const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
+            const result = await this._sendAndTrack(jid, messageContent, messageOptions);
             this._rememberOutgoingMedia(jid, result.key.id, videoUrl);
             return { success: true, message: 'Video sent successfully', data: { messageId: result.key.id, chatId: jid, timestamp: new Date().toISOString() } };
         } catch (error) {
@@ -1099,7 +1528,7 @@ class WhatsAppSession {
                     key: { remoteJid: jid, id: replyTo, fromMe: false }, message: { conversation: '' }
                 };
             }
-            const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
+            const result = await this._sendAndTrack(jid, messageContent, messageOptions);
             this._rememberOutgoingMedia(jid, result.key.id, file.url);
             return {
                 success: true, message: `${kind} sent successfully`,
@@ -1229,7 +1658,7 @@ class WhatsAppSession {
                 }
             }
 
-            const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
+            const result = await this._sendAndTrack(jid, messageContent, messageOptions);
 
             return {
                 success: true,
@@ -1282,7 +1711,7 @@ class WhatsAppSession {
                 }
             }
 
-            const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
+            const result = await this._sendAndTrack(jid, messageContent, messageOptions);
 
             return {
                 success: true,
@@ -1336,7 +1765,7 @@ class WhatsAppSession {
                 }
             }
 
-            const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
+            const result = await this._sendAndTrack(jid, messageContent, messageOptions);
 
             return {
                 success: true,
@@ -1399,7 +1828,7 @@ class WhatsAppSession {
                 }
             }
 
-            const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
+            const result = await this._sendAndTrack(jid, messageContent, messageOptions);
 
             return {
                 success: true,
@@ -1457,7 +1886,7 @@ class WhatsAppSession {
                 }
             }
 
-            const result = await this.socket.sendMessage(jid, messageContent, messageOptions);
+            const result = await this._sendAndTrack(jid, messageContent, messageOptions);
 
             return {
                 success: true,
@@ -1599,9 +2028,12 @@ class WhatsAppSession {
                 const all = await this.socket.groupFetchAllParticipating();
                 targets = Object.keys(all);
             }
+
             const groups = [];
-            const contacts = [];
             const errors = [];
+            const participantRows = [];
+
+            // 1. Fetch metadata for all targets first
             for (const gid of targets) {
                 let metadata;
                 try {
@@ -1612,24 +2044,81 @@ class WhatsAppSession {
                 }
                 groups.push({ id: metadata.id, name: metadata.subject, participantsCount: metadata.participants.length });
                 for (const part of metadata.participants) {
-                    let jid = part.id;
-                    if (jid.endsWith('@lid') && this.store) {
-                        const identity = this.store.resolveIdentity(jid);
-                        if (identity && identity.jid) jid = identity.jid;
-                    }
-                    const known = this.store ? this.store.getContact(jid) : null;
-                    contacts.push({
-                        jid,
-                        phone: jid.split('@')[0],
-                        name: (known && (known.name || known.notify)) || null,
-                        admin: part.admin || null,
-                        groupId: metadata.id,
-                        groupName: metadata.subject,
-                        sessionId: this.sessionId,
-                        accountName: this.name || this.sessionId
-                    });
+                    participantRows.push({ part, groupId: metadata.id, groupName: metadata.subject });
                 }
             }
+
+            // 2. Resolve LID participants.
+            //    - groupMetadata already includes `phoneNumber` for many LID participants;
+            //      we use that directly and store the mapping.
+            //    - For any remaining uncached LIDs we fall back to the persistent LID-PN
+            //      mapping store and, as a last resort, a bounded USync query.
+            const contacts = [];
+            const unresolvedLids = [];
+            for (const { part, groupId, groupName } of participantRows) {
+                let jid = part.id;
+                let phone = null;
+
+                if (jid.endsWith('@lid')) {
+                    // groupMetadata already exposes the real number for most LID
+                    // participants via `phoneNumber`. Baileys returns it as a full PN
+                    // JID (e.g. "919876543210@s.whatsapp.net"), so we must strip the
+                    // suffix to get the digits — a bare /^\d+$/ test on the JID always
+                    // fails and (previously) pushed everything into the rate-limited
+                    // USync path, leaving only raw LIDs.
+                    const pnDigits = this._extractPhoneDigits(part.phoneNumber);
+                    if (pnDigits) {
+                        phone = pnDigits;
+                        jid = `${phone}@c.us`;
+                        this.store?.registerIdentity(part.id, jid);
+                        // Also persist in Baileys' LID mapping store for other code paths
+                        const lidMapping = this.socket.signalRepository?.lidMapping;
+                        if (lidMapping?.storeLIDPNMappings) {
+                            lidMapping.storeLIDPNMappings([{ lid: part.id, pn: `${phone}@s.whatsapp.net` }]).catch(() => {});
+                        }
+                    } else {
+                        // Try cache / signal repository / USync
+                        const resolved = this.store ? this.store.resolveIdentity(jid) : null;
+                        if (resolved?.jid) {
+                            jid = this.normalizePhoneJid(resolved.jid);
+                            phone = jid.split('@')[0];
+                        } else {
+                            unresolvedLids.push(jid);
+                        }
+                    }
+                } else if (jid.endsWith('@c.us') || jid.endsWith('@s.whatsapp.net')) {
+                    phone = jid.split('@')[0];
+                }
+
+                const known = this.store ? this.store.getContact(jid) : null;
+                contacts.push({
+                    jid,
+                    phone,
+                    name: (known && (known.name || known.notify)) || null,
+                    admin: part.admin || null,
+                    groupId,
+                    groupName,
+                    sessionId: this.sessionId,
+                    accountName: this.name || this.sessionId
+                });
+            }
+
+            if (unresolvedLids.length) {
+                // ONE batched USync query for all remaining unresolved LIDs.
+                const batch = await this._resolveLidsBatch([...new Set(unresolvedLids)]);
+                // Patch any rows we already built that are still unresolved.
+                for (const row of contacts) {
+                    if (row.phone || !row.jid.endsWith('@lid')) continue;
+                    const hit = batch.get(row.jid) || this.store?.resolveIdentity(row.jid);
+                    if (hit?.jid) {
+                        row.jid = this.normalizePhoneJid(hit.jid);
+                        row.phone = hit.pn || row.jid.split('@')[0];
+                        const known = this.store?.getContact(row.jid);
+                        if (known?.name || known?.notify) row.name = known.name || known.notify;
+                    }
+                }
+            }
+
             return { success: true, data: { groups, contacts, errors: errors.length ? errors : undefined } };
         } catch (error) {
             return { success: false, message: error.message };
@@ -1962,42 +2451,70 @@ class WhatsAppSession {
             const total = chats.length;
             const paginatedChats = chats.slice(offset, offset + limit);
 
-            // Transform to expected format (pure in-memory, no network calls)
-            const formattedChats = paginatedChats.map(chat => {
-                let resolvedId = chat.id;
-                let resolvedPhone = chat.isGroup ? null : chat.id.split('@')[0];
-                let resolvedName = chat.name;
+            // Pre-resolve uncached LIDs with ONE batched USync query (plus cooldown
+            // after failures). Local sources are checked first; only unmapped LIDs
+            // go over the wire — this is what avoids `rate-overlimit`.
+            const lids = [...new Set(
+                paginatedChats
+                    .filter((c) => !c.isGroup && c.id.endsWith('@lid'))
+                    .map((c) => c.id)
+            )];
+            await this._resolveLidsBatch(lids);
 
-                if (!chat.isGroup && this.store) {
-                    const resolved = this.store.resolveIdentity(chat.id);
-                    if (resolved) {
-                        resolvedId = resolved.jid || resolvedId;
-                        resolvedPhone = resolved.pn || resolvedPhone;
+            // Transform to expected format. LID-based chats are resolved via the
+            // identity cache and, on cache miss, via the WhatsApp server so the
+            // displayed phone number/name is always a real phone number.
+            const formattedChats = await Promise.all(
+                paginatedChats.map(async (chat) => {
+                    const identity = await this._resolveChatIdentity(chat.id);
+                    const resolvedId = identity.id;
+                    const resolvedPhone = chat.isGroup ? null : identity.phone;
+
+                    let resolvedName = chat.name;
+                    if (chat.isGroup) {
+                        resolvedName =
+                            this.store?.groupMetadata.get(resolvedId)?.subject ||
+                            chat.name ||
+                            resolvedId.split('@')[0];
+                    } else {
+                        const contact = this.store?.getContact(resolvedId);
+                        const rawLid = chat.id.endsWith('@lid') ? chat.id.split('@')[0] : null;
+                        // Recompute the name if the cached overview still carries a raw LID
+                        // or a stale numeric string that does not match the resolved phone.
+                        const isNameJustDigits = resolvedName && /^\d+$/.test(resolvedName);
+                        const nameDoesntMatchPhone = isNameJustDigits && resolvedPhone && resolvedName !== resolvedPhone;
+                        if (!resolvedName || resolvedName === rawLid || resolvedName.endsWith('@lid') || nameDoesntMatchPhone) {
+                            resolvedName =
+                                contact?.name ||
+                                contact?.notify ||
+                                contact?.verifiedName ||
+                                // Recover a display name from any incoming message's
+                                // pushName (covers @lid chats whose last msg is outgoing).
+                                this.store?._findPushName?.(resolvedId) ||
+                                this.store?._findPushName?.(chat.id) ||
+                                resolvedPhone ||
+                                resolvedId.split('@')[0];
+                        }
                     }
 
-                    // Fix name if it's still LID-based
-                    const lidNumber = chat.id.endsWith('@lid') ? chat.id.split('@')[0] : null;
-                    if (resolvedName && (resolvedName.endsWith('@lid') || resolvedName === lidNumber)) {
-                        const contact = this.store.getContact(resolvedId);
-                        resolvedName = contact?.name || contact?.notify || resolvedPhone || resolvedId.split('@')[0];
-                    }
-                }
-
-                return {
-                    id: resolvedId,
-                    name: resolvedName,
-                    phone: resolvedPhone,
-                    isGroup: chat.isGroup,
-                    profilePicture: chat.profilePicture,
-                    participantsCount: null,
-                    lastMessage: chat.lastMessage?.preview || null,
-                    lastMessageTimestamp: BaileysStore.toUnixSeconds(chat.lastMessage?.timestamp || chat.conversationTimestamp),
-                    unreadCount: chat.unreadCount || 0
-                };
-            });
+                    return {
+                        id: resolvedId,
+                        name: resolvedName,
+                        phone: resolvedPhone,
+                        isGroup: chat.isGroup,
+                        profilePicture: chat.profilePicture,
+                        participantsCount: chat.isGroup
+                            ? this.store?.groupMetadata.get(resolvedId)?.participants?.length || null
+                            : null,
+                        lastMessage: chat.lastMessage?.preview || null,
+                        lastMessageTimestamp: BaileysStore.toUnixSeconds(chat.lastMessage?.timestamp || chat.conversationTimestamp),
+                        unreadCount: chat.unreadCount || 0
+                    };
+                })
+            );
 
             // Fetch missing profile pictures in background (non-blocking)
-            this._fetchMissingProfilePictures(paginatedChats);
+            this._fetchMissingProfilePictures(formattedChats);
 
             return {
                 success: true,
@@ -2191,13 +2708,26 @@ class WhatsAppSession {
                             description: metadata.desc || null,
                             participants: metadata.participants.map(p => {
                                 let resolvedId = p.id;
-                                let resolvedPhone = p.id.split('@')[0];
-                                if (this.store) {
+                                let resolvedPhone = null;
+                                // 1. Prefer the phone number WhatsApp ships inside the
+                                //    group metadata (full PN JID for LID participants).
+                                const metaDigits = this._extractPhoneDigits(p.phoneNumber);
+                                if (metaDigits) {
+                                    resolvedId = `${metaDigits}@c.us`;
+                                    resolvedPhone = metaDigits;
+                                    this.store?.registerIdentity(p.id, resolvedId);
+                                } else if (this.store) {
+                                    // 2. Fall back to our cached LID→PN mapping.
                                     const resolved = this.store.resolveIdentity(p.id);
                                     if (resolved) {
                                         resolvedId = resolved.jid || resolvedId;
-                                        resolvedPhone = resolved.pn || resolvedPhone;
+                                        resolvedPhone = resolved.pn || null;
                                     }
+                                }
+                                // 3. Last resort: only expose bare digits when it is a
+                                //    real phone JID — never surface a raw LID as a number.
+                                if (!resolvedPhone) {
+                                    resolvedPhone = this._extractPhoneDigits(resolvedId);
                                 }
                                 return {
                                     id: resolvedId,
@@ -2818,11 +3348,29 @@ class WhatsAppSession {
                     restrict: metadata.restrict,
                     announce: metadata.announce,
                     size: metadata.size,
-                    participants: metadata.participants?.map(p => ({
-                        id: p.id,
-                        admin: p.admin || null,
-                        isSuperAdmin: p.admin === 'superadmin'
-                    })),
+                    participants: metadata.participants?.map(p => {
+                        // Resolve a real phone number: metadata phone_number first,
+                        // then cached LID→PN mapping, then bare digits if it is a PN JID.
+                        let phone = this._extractPhoneDigits(p.phoneNumber);
+                        let id = p.id;
+                        if (phone) {
+                            id = `${phone}@c.us`;
+                            this.store?.registerIdentity(p.id, id);
+                        } else if (this.store) {
+                            const resolved = this.store.resolveIdentity(p.id);
+                            if (resolved?.jid) {
+                                id = resolved.jid;
+                                phone = resolved.pn || this._extractPhoneDigits(resolved.jid);
+                            }
+                        }
+                        if (!phone) phone = this._extractPhoneDigits(id);
+                        return {
+                            id,
+                            phone,
+                            admin: p.admin || null,
+                            isSuperAdmin: p.admin === 'superadmin'
+                        };
+                    }),
                     creation: metadata.creation,
                     owner: metadata.owner
                 }

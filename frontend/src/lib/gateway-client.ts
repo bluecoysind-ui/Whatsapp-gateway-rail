@@ -34,8 +34,32 @@ export type GatewaySession = {
   webhooks?: Array<{ url: string; events?: string[] }>;
   /** Redacted proxy URL (password masked) the session connects through, or null. */
   proxy?: string | null;
+  /** Proxy pool / rotation details for this account. */
+  proxyInfo?: ProxyInfo | null;
   /** History-sync progress; `active` while WhatsApp is still pushing history. */
   sync?: SyncState | null;
+};
+
+/** Per-account proxy state surfaced by the backend. */
+export type ProxyInfo = {
+  /** Redacted proxy URL the account is (or will be) using, or null for direct. */
+  active: string | null;
+  /** True when the live socket is currently up through this proxy. */
+  connected: boolean;
+  /** Where the proxy comes from: an explicit session proxy, the shared pool, or none. */
+  source: "session" | "pool" | "none";
+  /** When true the account never connects directly (no direct fallback). */
+  required: boolean;
+  /** Number of proxies in the rotating pool. */
+  poolSize: number;
+  /** This account's index within the pool (null for an explicit session proxy). */
+  index: number | null;
+  /** How many times this account has rotated proxies. */
+  rotations: number;
+  /** Epoch ms of the last rotation, or null. */
+  rotatedAt: number | null;
+  /** Why the last rotation happened (e.g. "rate-overlimit"). */
+  lastReason: string | null;
 };
 
 export type GatewayEvent = {
@@ -52,6 +76,7 @@ export type EndpointDef = {
 };
 
 export const API_ENDPOINTS: EndpointDef[] = [
+  { group: "Sessions", value: "GET|/api/whatsapp/qr", label: "GET /qr?username=&phone_number=" },
   { group: "Sessions", value: "GET|/api/whatsapp/sessions", label: "GET /sessions - List all sessions" },
   { group: "Sessions", value: "GET|/api/whatsapp/sessions/{sessionId}/status", label: "GET /sessions/:id/status" },
   { group: "Sessions", value: "GET|/api/whatsapp/sessions/{sessionId}/qr", label: "GET /sessions/:id/qr" },
