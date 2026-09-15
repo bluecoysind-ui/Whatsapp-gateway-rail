@@ -177,7 +177,10 @@ export default defineConfig(({ command, isPreview }) => ({
     ...(command === "build" || isPreview
       ? [
           nitro({
-            preset: "vercel",
+            // Default "vercel" (the backend-embedded build copies .vercel/output/static).
+            // Set NITRO_PRESET=node-server to build a standalone Node server for
+            // Railway/Render/Fly (.output/server/index.mjs, run with `node`).
+            preset: process.env.NITRO_PRESET || "vercel",
             // Auto-registers server/middleware/* (the PWA install page +
             // manifest + head-tag middleware). Nitro v3 defaults serverDir to
             // false, so removing this silently unwires /?install=1 on deploys.
