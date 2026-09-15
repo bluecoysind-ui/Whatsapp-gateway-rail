@@ -124,6 +124,13 @@ function buildProxyAgents(url) {
     };
 }
 
+/** Trim Railway/dashboard quoting so `"host"` and `'10001-10010'` still parse. */
+function env(name) {
+    const v = process.env[name];
+    if (v == null) return '';
+    return String(v).trim().replace(/^['"]+|['"]+$/g, '').trim();
+}
+
 /**
  * Expand a port specification into a flat list of port numbers.
  * Accepts comma/space separated single ports and inclusive ranges, e.g.
@@ -169,27 +176,27 @@ function expandPorts(spec) {
 function getProxyPool() {
     const raw = [];
 
-    if (process.env.PROXY_URLS) {
-        for (const part of process.env.PROXY_URLS.split(/[\s,]+/)) {
+    const urls = env('PROXY_URLS');
+    if (urls) {
+        for (const part of urls.split(/[\s,]+/)) {
             if (part.trim()) raw.push(part.trim());
         }
     }
 
-    if (process.env.PROXY_URL && process.env.PROXY_URL.trim()) {
-        raw.push(process.env.PROXY_URL.trim());
-    }
+    const single = env('PROXY_URL');
+    if (single) raw.push(single);
 
-    const host = process.env.PROXY_HOST && process.env.PROXY_HOST.trim();
+    const host = env('PROXY_HOST');
     if (host) {
-        const scheme = (process.env.PROXY_PROTOCOL || 'http').trim().toLowerCase();
-        const user = process.env.PROXY_USERNAME;
-        const pass = process.env.PROXY_PASSWORD;
+        const scheme = (env('PROXY_PROTOCOL') || 'http').toLowerCase();
+        const user = env('PROXY_USERNAME');
+        const pass = env('PROXY_PASSWORD');
         const auth = user ? `${encodeURIComponent(user)}:${encodeURIComponent(pass || '')}@` : '';
-        const ports = expandPorts(process.env.PROXY_PORTS);
+        const ports = expandPorts(env('PROXY_PORTS'));
         if (ports.length) {
             for (const port of ports) raw.push(`${scheme}://${auth}${host}:${port}`);
         } else {
-            const port = (process.env.PROXY_PORT || '').trim();
+            const port = env('PROXY_PORT');
             raw.push(`${scheme}://${auth}${host}${port ? `:${port}` : ''}`);
         }
     }
@@ -208,6 +215,12 @@ function getProxyPool() {
         seen.add(key);
         pool.push(url);
     }
+    if (!pool.length && (env('PROXY_HOST') || env('PROXY_URL') || env('PROXY_URLS'))) {
+        console.error(
+            '[proxy] PROXY_* is set but no valid pool entries were built. ' +
+            'Check PROXY_HOST / PROXY_URL / PROXY_PORTS (no extra quotes).'
+        );
+    }
     return pool;
 }
 
@@ -220,9 +233,9 @@ function getProxyPool() {
  * @returns {boolean}
  */
 function isProxyRequired(pool) {
-    const explicit = process.env.PROXY_REQUIRED;
-    if (explicit !== undefined && explicit !== '') {
-        return /^(1|true|yes|on)$/i.test(explicit.trim());
+    const explicit = env('PROXY_REQUIRED');
+    if (explicit) {
+        return /^(1|true|yes|on)$/i.test(explicit);
     }
     const p = pool || getProxyPool();
     return p.length > 0;

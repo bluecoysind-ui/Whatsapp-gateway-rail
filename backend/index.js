@@ -1,10 +1,16 @@
+const path = require('path');
+const dotenv = require('dotenv');
+// Load env before any service reads PROXY_* (Railway injects vars; local uses .env).
+// .env.example fills gaps when Docker/Railway omits .env (.dockerignore excludes it).
+dotenv.config();
+dotenv.config({ path: path.join(__dirname, '.env') });
+dotenv.config({ path: path.join(__dirname, '.env.example') });
+
 const express = require('express');
 const cors = require('cors');
-const path = require('path');
 const http = require('http');
 const swaggerUi = require('swagger-ui-express');
 const swaggerSpec = require('./src/config/swagger');
-require('dotenv').config();
 
 const app = express();
 const server = http.createServer(app);

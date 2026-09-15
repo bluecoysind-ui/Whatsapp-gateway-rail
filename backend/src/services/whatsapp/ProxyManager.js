@@ -161,6 +161,9 @@ class ProxyManager {
 
     /** Per-session assignment info (raw URL — caller redacts for output). */
     info(sessionId) {
+        if (sessionId && this.pool.length && !this.assignments.has(sessionId)) {
+            this.assign(sessionId);
+        }
         const a = this.assignments.get(sessionId) || null;
         return {
             url: a?.url || null,

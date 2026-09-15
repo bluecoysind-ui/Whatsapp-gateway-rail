@@ -62,8 +62,19 @@ function Card({
 }
 
 function QrModal() {
-  const { qrSession, qrSrc, qrExpiresAt, refreshQr, closeOverlay } = useGateway();
+  const {
+    qrSession,
+    qrSrc,
+    qrExpiresAt,
+    pairingCode,
+    pairingExpiresAt,
+    pairingLoading,
+    refreshQr,
+    requestPairingCode,
+    closeOverlay,
+  } = useGateway();
   const [now, setNow] = useState(() => Date.now());
+  const [phone, setPhone] = useState("");
 
   // Tick every second so the pairing countdown stays live.
   useEffect(() => {
@@ -88,8 +99,20 @@ function QrModal() {
         ? `QR expires in ${countdown}`
         : "QR expired — revoking session…";
 
+  const pairingSecondsLeft =
+    pairingExpiresAt !== null ? Math.max(0, Math.ceil((pairingExpiresAt - now) / 1000)) : null;
+  const formattedCode = useMemo(() => {
+    const raw = pairingCode.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+    if (raw.length === 8) return `${raw.slice(0, 4)}-${raw.slice(4)}`;
+    return pairingCode;
+  }, [pairingCode]);
+
+  const submitPhone = () => {
+    void requestPairingCode(phone);
+  };
+
   return (
-    <Card title="Scan QR Code" sub={`Session: ${qrSession || "—"}`}>
+    <Card title="Link WhatsApp" sub={`Session: ${qrSession || "—"}`}>
       <div className="mx-auto inline-block rounded-xl bg-white p-3">
         {qrSrc ? <img src={qrSrc} alt="QR" width={220} height={220} className="block size-[220px]" /> : <div className="size-[220px] animate-pulse bg-zinc-200" />}
       </div>
@@ -97,6 +120,57 @@ function QrModal() {
         {timerLabel}
       </p>
       <p className="mt-2 text-xs text-muted">Open WhatsApp → Linked Devices → Link a Device</p>
+
+      <div className="my-5 flex items-center gap-3 text-[11px] uppercase tracking-wide text-muted">
+        <span className="h-px flex-1 bg-line" />
+        or link with phone number
+        <span className="h-px flex-1 bg-line" />
+      </div>
+
+      <label className="block text-left text-xs text-muted">
+        Phone number (with country code)
+        <span className="mt-1 flex gap-2">
+          <input
+            value={phone}
+            onChange={(e) => setPhone(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") submitPhone();
+            }}
+            placeholder="919876543210"
+            inputMode="tel"
+            autoComplete="tel"
+            className="min-w-0 flex-1 rounded-xl border border-line bg-night/40 px-3 py-2.5 text-sm text-ink outline-none"
+          />
+          <button
+            type="button"
+            disabled={pairingLoading || !phone.replace(/\D/g, "")}
+            className="shrink-0 rounded-xl bg-wa px-3 py-2 text-sm font-semibold text-night disabled:opacity-50"
+            onClick={submitPhone}
+          >
+            {pairingLoading ? "…" : "Get code"}
+          </button>
+        </span>
+      </label>
+
+      {formattedCode ? (
+        <div className="mt-4 rounded-2xl border border-line bg-night/30 px-4 py-3">
+          <p className="text-[11px] uppercase tracking-wide text-muted">Pairing code</p>
+          <p className="mt-1 font-mono text-2xl font-semibold tracking-[0.2em] text-ink">{formattedCode}</p>
+          <p className="mt-2 text-xs text-muted">
+            WhatsApp → Linked Devices → Link with phone number instead
+            {pairingSecondsLeft !== null
+              ? pairingSecondsLeft > 0
+                ? ` · expires in ${pairingSecondsLeft}s`
+                : " · expired — request a new code"
+              : ""}
+          </p>
+        </div>
+      ) : (
+        <p className="mt-3 text-left text-xs text-muted">
+          Use the same number as the phone that will enter the code, including country code (India: 91…). No + or spaces.
+        </p>
+      )}
+
       <button className="mt-5 rounded-xl border border-line px-4 py-2 text-sm" onClick={closeOverlay}>
         Close
       </button>

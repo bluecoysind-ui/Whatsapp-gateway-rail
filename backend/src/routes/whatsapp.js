@@ -511,7 +511,7 @@ router.get('/sessions/:sessionId/qr', (req, res) => {
             });
         }
 
-        if (!sessionInfo.qrCode) {
+        if (!sessionInfo.qrCode && !sessionInfo.pairingCode) {
             return res.status(404).json({
                 success: false,
                 message: 'QR Code not available yet. Please wait...',
@@ -521,11 +521,14 @@ router.get('/sessions/:sessionId/qr', (req, res) => {
 
         res.json({
             success: true,
-            message: 'QR Code ready',
+            message: sessionInfo.qrCode ? 'QR Code ready' : 'Pairing code ready',
             data: {
                 sessionId: sessionInfo.sessionId,
                 qrCode: sessionInfo.qrCode,
                 qrExpiresAt: sessionInfo.qrExpiresAt,
+                pairingCode: sessionInfo.pairingCode || null,
+                pairingPhone: sessionInfo.pairingPhone || null,
+                pairingExpiresAt: sessionInfo.pairingExpiresAt || null,
                 status: sessionInfo.status
             }
         });
@@ -555,6 +558,62 @@ router.get('/sessions/:sessionId/qr/image', (req, res) => {
         res.send(imgBuffer);
     } catch (error) {
         res.status(500).send('Error generating QR image');
+    }
+});
+
+// Request a phone-number pairing code (alternative to scanning the QR)
+router.post('/sessions/:sessionId/pairing-code', async (req, res) => {
+    try {
+        const { sessionId } = req.params;
+        const phoneNumber = sanitisePhone(
+            req.body?.phoneNumber || req.body?.phone_number || req.body?.phone
+        );
+
+        if (!phoneNumber) {
+            return res.status(400).json({
+                success: false,
+                message: 'Missing required field: phoneNumber (with country code)'
+            });
+        }
+
+        const result = await whatsappManager.requestPairingCode(sessionId, phoneNumber);
+        if (!result.success) {
+            const status = result.message && result.message.includes('not found') ? 404 : 400;
+            return res.status(status).json({
+                success: false,
+                message: result.message
+            });
+        }
+
+        res.json({
+            success: true,
+            message: result.message,
+            data: result.data
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
+});
+
+// Remove every session whose QR login expired (unpaired leftovers)
+router.delete('/sessions/expired', (req, res) => {
+    try {
+        const result = whatsappManager.removeExpiredQrSessions();
+        res.json({
+            success: true,
+            message: result.removed.length
+                ? `Removed ${result.removed.length} expired QR session(s)`
+                : 'No expired QR sessions to remove',
+            data: { removed: result.removed }
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            message: error.message
+        });
     }
 });
 

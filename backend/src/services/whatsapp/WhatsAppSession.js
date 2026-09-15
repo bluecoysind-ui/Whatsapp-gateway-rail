@@ -1,4 +1,4 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, getContentType, jidNormalizedUser } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, getContentType, jidNormalizedUser, Browsers } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const path = require('path');
 const fs = require('fs');
@@ -12,6 +12,8 @@ const proxyManager = require('./ProxyManager');
 const sessionEvents = require('./sessionEvents');
 
 const QR_EXPIRY_MS = Number(process.env.QR_EXPIRY_MS) || 120_000;
+/** WhatsApp phone-number pairing codes typically last about a minute. */
+const PAIRING_EXPIRY_MS = Number(process.env.PAIRING_EXPIRY_MS) || 60_000;
 /** Incoming media above this size is fetched on demand instead of auto-saved. */
 const MEDIA_AUTOSAVE_MAX_BYTES = Number(process.env.MEDIA_AUTOSAVE_MAX_BYTES) || 25 * 1024 * 1024;
 
@@ -36,6 +38,14 @@ class WhatsAppSession {
         this.qrTimer = null;
         this.qrExpired = false;
         this.qrExpiresAt = null;
+        this.pairingCode = null;
+        this.pairingPhone = null;
+        this.pairingExpiresAt = null;
+        this.pairingTimer = null;
+        // When true, this unpaired session uses phone-number pairing instead of QR.
+        this.pairingMode = false;
+        this._pendingPairingPhone = null;
+        this._pairingRequested = false;
         // True once the auth creds are paired/registered. A registered session must
         // NEVER be treated as an expired QR (that would delete its whole folder).
         this.registered = false;
@@ -63,6 +73,10 @@ class WhatsAppSession {
 
         // USync batch cooldown: no directory queries until this timestamp.
         this._usyncCooldownUntil = 0;
+
+        // Called by WhatsAppManager to drop this session from the live map
+        // after an unpaired QR expires.
+        this.onQrExpired = typeof options.onQrExpired === 'function' ? options.onQrExpired : null;
 
         // Load config if exists, then let constructor options win so a new
         // connect (e.g. QR link with username) is not overwritten by a stale file.
@@ -233,13 +247,13 @@ class WhatsAppSession {
             return { success: false, message: `Already ${this.connectionStatus}` };
         }
 
-        // Drop any lingering (dead) socket before creating a new one.
-        this._teardownSocket();
-
         this._connecting = true;
         try {
+            // Drop any lingering (dead) socket before creating a new one.
+            this._teardownSocket();
             this._clearQrTimer();
             this.qrExpired = false;
+            if (this.pairingMode) this._pairingRequested = false;
 
             // Pastikan folder auth ada
             if (!fs.existsSync(this.authFolder)) {
@@ -270,6 +284,9 @@ class WhatsAppSession {
                     // Silent fail
                 }
             }, 30_000);
+
+            // Re-read PROXY_* in case env was not available at process start (Railway).
+            if (proxyManager.size() === 0) proxyManager.reload();
 
             // Decide the egress proxy and whether direct connection is forbidden.
             //   - An explicit per-session proxy (this.proxy) always wins and is sticky.
@@ -322,12 +339,17 @@ class WhatsAppSession {
             this.registered = Boolean(state.creds && state.creds.registered);
             const { version } = await fetchLatestBaileysVersion();
 
+            // Pairing-code login requires a recognised companion identity. A custom
+            // browser string (and mixing QR refs with link-code registration) is what
+            // made WhatsApp reject codes with "couldn't link device".
+            const pairing = this.pairingMode && !this.registered;
             this.socket = makeWASocket({
                 version,
                 auth: state,
                 logger: pino({ level: 'silent' }),
-                browser: ['Chatery API', 'Chrome', '1.0.0'],
+                browser: pairing || !this.registered ? Browsers.ubuntu('Chrome') : ['Chatery API', 'Chrome', '1.0.0'],
                 syncFullHistory: true,
+                qrTimeout: pairing ? 90_000 : 60_000,
                 ...(proxyAgents ? { agent: proxyAgents.agent, fetchAgent: proxyAgents.fetchAgent } : {})
             });
 
@@ -365,6 +387,7 @@ class WhatsAppSession {
     }
 
     _startQrExpiryTimer() {
+        if (this.pairingMode) return;
         if (this.qrTimer) return;
         this.qrExpiresAt = Date.now() + QR_EXPIRY_MS;
         this.qrTimer = setTimeout(() => {
@@ -389,9 +412,134 @@ class WhatsAppSession {
         this.qrExpiresAt = null;
     }
 
+    _clearPairing(resetMode = false) {
+        if (this.pairingTimer) {
+            clearTimeout(this.pairingTimer);
+            this.pairingTimer = null;
+        }
+        this.pairingCode = null;
+        this.pairingExpiresAt = null;
+        if (resetMode) {
+            this.pairingMode = false;
+            this._pendingPairingPhone = null;
+            this._pairingRequested = false;
+            this.pairingPhone = null;
+        }
+    }
+
+    _startPairingExpiryTimer() {
+        if (this.pairingTimer) {
+            clearTimeout(this.pairingTimer);
+            this.pairingTimer = null;
+        }
+        this.pairingExpiresAt = Date.now() + PAIRING_EXPIRY_MS;
+        this.pairingTimer = setTimeout(() => {
+            this.pairingTimer = null;
+            this.pairingCode = null;
+            this.pairingExpiresAt = null;
+            wsManager.emitPairingCode(this.sessionId, null, {
+                phoneNumber: this.pairingPhone,
+                pairingExpiresAt: null,
+                expired: true
+            });
+        }, PAIRING_EXPIRY_MS);
+    }
+
+    /**
+     * Ask WhatsApp for a pairing code on the live socket. Official flow: wait
+     * until the first `qr` event (socket ready), then request once and ignore
+     * later QR refreshes so they don't invalidate the code.
+     */
+    async _requestPairingOnSocket(phone) {
+        const code = await this.socket.requestPairingCode(phone);
+        this.pairingCode = code;
+        this.pairingPhone = phone;
+        this._pendingPairingPhone = phone;
+        this._pendingLink = true;
+        this._startPairingExpiryTimer();
+
+        console.log(`🔢 [${this.sessionId}] Pairing code generated for ${phone}: ${String(code).slice(0, 4)}-****`);
+        wsManager.emitPairingCode(this.sessionId, this.pairingCode, {
+            phoneNumber: phone,
+            pairingExpiresAt: this.pairingExpiresAt
+        });
+        wsManager.emitSessionStatus(this.sessionId, this.connectionStatus, {
+            pairingCode: this.pairingCode,
+            pairingExpiresAt: this.pairingExpiresAt,
+            pairingPhone: phone
+        });
+        return code;
+    }
+
+    /**
+     * Request a WhatsApp pairing code for phone-number login.
+     * Restarts the unpaired socket in pairing-only mode so the code is requested
+     * on the first QR handshake with a recognised Chrome/Ubuntu identity.
+     */
+    async requestPairingCode(phoneNumber) {
+        const phone = this._extractPhoneDigits(phoneNumber);
+        if (!phone || phone.length < 11 || phone.length > 15) {
+            return {
+                success: false,
+                message: 'Enter the full WhatsApp number with country code (e.g. 919876543210). No + or spaces.'
+            };
+        }
+        if (this.connectionStatus === 'connected' || this.registered) {
+            return { success: false, message: 'Session is already linked to WhatsApp' };
+        }
+
+        this.pairingMode = true;
+        this._pendingPairingPhone = phone;
+        this.pairingPhone = phone;
+        this._pairingRequested = false;
+        this.pairingCode = null;
+        this.qrExpired = false;
+        this._clearQrTimer();
+
+        console.log(`[${this.sessionId}] Starting pairing-code login for ${phone}`);
+
+        try {
+            // Wait out an in-flight connect, then rebuild the socket in pairing mode.
+            const waitUntil = Date.now() + 15_000;
+            while (this._connecting && Date.now() < waitUntil) {
+                await new Promise((resolve) => setTimeout(resolve, 150));
+            }
+            const started = await this.connect();
+            if (!started.success && !this.socket) {
+                return { success: false, message: started.message || 'Could not start pairing session' };
+            }
+
+            const deadline = Date.now() + 30_000;
+            while (Date.now() < deadline) {
+                if (this.pairingCode) {
+                    return {
+                        success: true,
+                        message: 'Pairing code generated',
+                        data: {
+                            sessionId: this.sessionId,
+                            pairingCode: this.pairingCode,
+                            pairingPhone: phone,
+                            pairingExpiresAt: this.pairingExpiresAt,
+                            status: this.connectionStatus
+                        }
+                    };
+                }
+                if (this.connectionStatus === 'qr_expired' || this.connectionStatus === 'logged_out') {
+                    return { success: false, message: 'Session ended before a pairing code was ready' };
+                }
+                await new Promise((resolve) => setTimeout(resolve, 250));
+            }
+            return { success: false, message: 'Timed out waiting for pairing code. Try again in a few seconds.' };
+        } catch (error) {
+            this._pairingRequested = false;
+            return { success: false, message: error.message || 'Failed to request pairing code' };
+        }
+    }
+
     _markQrExpired(reason) {
         if (this.connectionStatus === 'qr_expired') return;
         this._clearQrTimer();
+        this._clearPairing(true);
         this.qrExpired = false;
         this._pendingLink = false;
         this.connectionStatus = 'qr_expired';
@@ -408,6 +556,12 @@ class WhatsAppSession {
         }
         // Only wipe creds for an unpaired session; a paired one is never QR-expired.
         if (!this.registered) this.deleteAuthFolder();
+
+        if (typeof this.onQrExpired === 'function') {
+            setImmediate(() => {
+                try { this.onQrExpired(this.sessionId); } catch (e) { /* ignore */ }
+            });
+        }
     }
 
     _setupEventListeners(saveCreds) {
@@ -416,6 +570,24 @@ class WhatsAppSession {
             const { connection, lastDisconnect, qr } = update;
 
             if (qr) {
+                // Pairing-code mode: the first QR event means the socket is ready.
+                // Request the code once and ignore later QR refreshes — those refs
+                // invalidate the link-code registration ("couldn't link device").
+                if (this.pairingMode && this._pendingPairingPhone && !this.registered) {
+                    this.connectionStatus = 'qr_ready';
+                    this._pendingLink = true;
+                    if (!this._pairingRequested && this.socket?.requestPairingCode) {
+                        this._pairingRequested = true;
+                        try {
+                            await this._requestPairingOnSocket(this._pendingPairingPhone);
+                        } catch (error) {
+                            this._pairingRequested = false;
+                            console.error(`[${this.sessionId}] Pairing code request failed:`, error.message);
+                        }
+                    }
+                    return;
+                }
+
                 this.qrCode = await qrcode.toDataURL(qr);
                 this.connectionStatus = 'qr_ready';
                 this._pendingLink = true;
@@ -432,6 +604,7 @@ class WhatsAppSession {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
                 const qrExpired =
                     !this.registered &&
+                    !this.pairingMode &&
                     (this.qrExpired ||
                         reason === 'QR refs attempts ended' ||
                         (statusCode === DisconnectReason.timedOut && !this.phoneNumber));
@@ -480,6 +653,10 @@ class WhatsAppSession {
                 });
 
                 if (shouldReconnect) {
+                    if (this._connecting) {
+                        console.log(`[${this.sessionId}] Socket closed during connect() — skipping extra reconnect`);
+                        return;
+                    }
                     // Rotate the egress proxy when the drop looks like a rate limit,
                     // or after repeated failures, so no account stays pinned to a bad IP.
                     this._proxyFailures++;
@@ -505,7 +682,12 @@ class WhatsAppSession {
                     // overlapping close events can't spawn duplicate sockets.
                     this._teardownSocket();
                     clearTimeout(this._reconnectTimer);
-                    this._reconnectTimer = setTimeout(() => this.connect(), 5000);
+                    const reconnectMs = this.pairingMode && !this.registered ? 800 : 5000;
+                    if (this.pairingMode && !this.registered) {
+                        this._pairingRequested = false;
+                        this.pairingCode = null;
+                    }
+                    this._reconnectTimer = setTimeout(() => this.connect(), reconnectMs);
                 } else {
                     console.log(`[${this.sessionId}] Logged out.`);
                     wsManager.emitLoggedOut(this.sessionId);
@@ -513,6 +695,7 @@ class WhatsAppSession {
                 }
             } else if (connection === 'open') {
                 this._clearQrTimer();
+                this._clearPairing(true);
                 this.qrExpired = false;
                 this._proxyFailures = 0; // healthy again — reset the rotation counter
                 const justLinked = this._pendingLink;
@@ -579,7 +762,16 @@ class WhatsAppSession {
         });
 
         // Save credentials
-        this.socket.ev.on('creds.update', saveCreds);
+        this.socket.ev.on('creds.update', async (update) => {
+            try {
+                await saveCreds(update);
+            } catch (e) {
+                try { await saveCreds(); } catch { /* ignore */ }
+            }
+            if (this.socket?.authState?.creds?.registered) {
+                this.registered = true;
+            }
+        });
 
         // Messages upsert (new messages)
         this.socket.ev.on('messages.upsert', async (m) => {
@@ -772,6 +964,9 @@ class WhatsAppSession {
             name: this.name,
             qrCode: this.qrCode,
             qrExpiresAt: this.qrExpiresAt,
+            pairingCode: this.pairingCode,
+            pairingPhone: this.pairingPhone,
+            pairingExpiresAt: this.pairingExpiresAt,
             storeStats: this.store ? this.store.getStats() : null,
             metadata: this.metadata,
             webhooks: this.webhooks,
@@ -794,6 +989,7 @@ class WhatsAppSession {
     async logout() {
         try {
             this._clearQrTimer();
+            this._clearPairing(true);
             clearTimeout(this._proxyRetryTimer);
             clearTimeout(this._reconnectTimer);
             this._reconnectTimer = null;

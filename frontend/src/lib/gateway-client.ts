@@ -80,11 +80,13 @@ export const API_ENDPOINTS: EndpointDef[] = [
   { group: "Sessions", value: "GET|/api/whatsapp/sessions", label: "GET /sessions - List all sessions" },
   { group: "Sessions", value: "GET|/api/whatsapp/sessions/{sessionId}/status", label: "GET /sessions/:id/status" },
   { group: "Sessions", value: "GET|/api/whatsapp/sessions/{sessionId}/qr", label: "GET /sessions/:id/qr" },
+  { group: "Sessions", value: "POST|/api/whatsapp/sessions/{sessionId}/pairing-code", label: "POST /sessions/:id/pairing-code" },
   { group: "Sessions", value: "GET|/api/whatsapp/sessions/{sessionId}/qr/image", label: "GET /sessions/:id/qr/image" },
   { group: "Sessions", value: "POST|/api/whatsapp/sessions/{sessionId}/connect", label: "POST /sessions/:id/connect" },
   { group: "Sessions", value: "PATCH|/api/whatsapp/sessions/{sessionId}/config", label: "PATCH /sessions/:id/config" },
   { group: "Sessions", value: "POST|/api/whatsapp/sessions/{sessionId}/webhooks", label: "POST /sessions/:id/webhooks" },
   { group: "Sessions", value: "DELETE|/api/whatsapp/sessions/{sessionId}/webhooks", label: "DELETE /sessions/:id/webhooks" },
+  { group: "Sessions", value: "DELETE|/api/whatsapp/sessions/expired", label: "DELETE /sessions/expired" },
   { group: "Sessions", value: "DELETE|/api/whatsapp/sessions/{sessionId}", label: "DELETE /sessions/:id" },
   { group: "Sessions", value: "POST|/api/whatsapp/proxy/test", label: "POST /proxy/test - Check a proxy" },
   { group: "Messaging", value: "POST|/api/whatsapp/chats/send-text", label: "POST /chats/send-text" },
@@ -203,6 +205,18 @@ export function sampleBodyFor(path: string, method: string): { body: unknown | n
       help: "Leave events empty to receive all events.",
     };
   }
+  if (path.includes("/sessions/expired")) {
+    return {
+      body: null,
+      help: "Deletes unpaired sessions whose QR (or pairing) login expired. Linked accounts are never removed.",
+    };
+  }
+  if (path.includes("/pairing-code")) {
+    return {
+      body: { phoneNumber: "919876543210" },
+      help: "WhatsApp number with country code (digits only). Enter the returned pairing code in WhatsApp → Linked Devices → Link with phone number.",
+    };
+  }
   if (path.includes("/connect")) {
     return {
       body: { proxy: "" },
@@ -275,7 +289,32 @@ export async function deleteSession(sessionId: string) {
 
 export async function getQr(sessionId: string) {
   const response = await apiFetch(`${API_BASE}/sessions/${sessionId}/qr`);
-  return response.json() as Promise<{ success: boolean; data?: { qrCode: string; qrExpiresAt?: number } }>;
+  return response.json() as Promise<{
+    success: boolean;
+    data?: {
+      qrCode: string;
+      qrExpiresAt?: number;
+      pairingCode?: string | null;
+      pairingPhone?: string | null;
+      pairingExpiresAt?: number | null;
+    };
+  }>;
+}
+
+export async function requestPairingCode(sessionId: string, phoneNumber: string) {
+  const response = await apiFetch(`${API_BASE}/sessions/${sessionId}/pairing-code`, {
+    method: "POST",
+    body: JSON.stringify({ phoneNumber }),
+  });
+  return response.json() as Promise<{
+    success: boolean;
+    message?: string;
+    data?: {
+      pairingCode: string;
+      pairingPhone: string;
+      pairingExpiresAt?: number | null;
+    };
+  }>;
 }
 
 export async function sendText(payload: { sessionId: string; chatId: string; message: string }) {

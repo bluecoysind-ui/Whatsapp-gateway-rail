@@ -147,6 +147,13 @@ class WebSocketManager {
     }
 
     /**
+     * Emit a phone-number pairing code (alternative to scanning the QR).
+     */
+    emitPairingCode(sessionId, pairingCode, details = {}) {
+        this.emitToSession(sessionId, 'pairing.code', { pairingCode, ...details });
+    }
+
+    /**
      * Emit connection status change
      */
     emitConnectionStatus(sessionId, status, details = {}) {

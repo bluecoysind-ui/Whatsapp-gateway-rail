@@ -27,13 +27,19 @@ class WhatsAppManager {
             const sessionDirs = fs.readdirSync(this.sessionsFolder);
             for (const sessionId of sessionDirs) {
                 const sessionPath = path.join(this.sessionsFolder, sessionId);
-                if (fs.statSync(sessionPath).isDirectory()) {
-                    console.log(`🔄 Restoring session: ${sessionId}`);
-                    // Session will load its own config from file
-                    const session = new WhatsAppSession(sessionId, {});
-                    this.sessions.set(sessionId, session);
-                    await session.connect();
+                if (!fs.statSync(sessionPath).isDirectory()) continue;
+                const credsPath = path.join(sessionPath, 'creds.json');
+                if (!fs.existsSync(credsPath)) {
+                    // Leftover folder from an expired/unpaired QR — do not resurrect it.
+                    try { fs.rmSync(sessionPath, { recursive: true, force: true }); } catch { /* ignore */ }
+                    console.log(`🗑️ Skipping empty/expired session folder: ${sessionId}`);
+                    continue;
                 }
+                console.log(`🔄 Restoring session: ${sessionId}`);
+                const session = new WhatsAppSession(sessionId, {});
+                this._bindSession(session);
+                this.sessions.set(sessionId, session);
+                await session.connect();
             }
         } catch (error) {
             console.error('Error initializing sessions:', error);
@@ -65,6 +71,7 @@ class WhatsAppManager {
             if (options.metadata || options.webhooks || options.proxy !== undefined) {
                 existingSession.updateConfig(options);
             }
+            this._bindSession(existingSession);
             
             if (existingSession.connectionStatus === 'connected') {
                 return { 
@@ -84,6 +91,7 @@ class WhatsAppManager {
 
         // Create new session with options
         const session = new WhatsAppSession(sessionId, options);
+        this._bindSession(session);
         session._saveConfig(); // Save initial config
         this.sessions.set(sessionId, session);
         await session.connect();
@@ -105,10 +113,52 @@ class WhatsAppManager {
     }
 
     /**
+     * Attach manager-owned callbacks on a session instance.
+     */
+    _bindSession(session) {
+        if (!session) return;
+        session.onQrExpired = (sessionId) => this.dropExpiredQrSession(sessionId);
+    }
+
+    /**
+     * Remove one unpaired session whose QR (or pairing) expired.
+     * Auth is already wiped by the session; this drops it from the live map
+     * so it no longer appears in the dashboard.
+     */
+    dropExpiredQrSession(sessionId) {
+        const session = this.sessions.get(sessionId);
+        if (!session) return { success: true, removed: [] };
+        if (session.registered || session.connectionStatus === 'connected') {
+            return { success: false, message: 'Refusing to drop a linked session', removed: [] };
+        }
+        try { session._teardownSocket(); } catch { /* already closed */ }
+        try { session.deleteAuthFolder(); } catch { /* already gone */ }
+        this.sessions.delete(sessionId);
+        wsManager.emitSessionStatus(sessionId, 'deleted', { reason: 'qr_expired' });
+        console.log(`🗑️ Removed expired QR session: ${sessionId}`);
+        return { success: true, removed: [sessionId] };
+    }
+
+    /**
+     * Remove every in-memory session whose QR login expired.
+     */
+    removeExpiredQrSessions() {
+        const removed = [];
+        for (const [sessionId, session] of [...this.sessions.entries()]) {
+            if (session.connectionStatus === 'qr_expired') {
+                this.dropExpiredQrSession(sessionId);
+                removed.push(sessionId);
+            }
+        }
+        return { success: true, removed };
+    }
+
+    /**
      * Get all sessions info
      * @returns {Array}
      */
     getAllSessions() {
+        this.removeExpiredQrSessions();
         const sessionsInfo = [];
         for (const [sessionId, session] of this.sessions) {
             sessionsInfo.push(session.getInfo());
@@ -208,6 +258,19 @@ class WhatsAppManager {
             return { success: false, message: 'Session not found', data: null };
         }
         return { success: Boolean(info.qrCode || info.isConnected), data: info };
+    }
+
+    /**
+     * Request a phone-number pairing code for an unpaired session.
+     * The session must already be connecting (QR available); the code is an
+     * alternative to scanning.
+     */
+    async requestPairingCode(sessionId, phoneNumber) {
+        const session = this.getSession(sessionId);
+        if (!session) {
+            return { success: false, message: 'Session not found. Create the session first.' };
+        }
+        return session.requestPairingCode(phoneNumber);
     }
 }
 

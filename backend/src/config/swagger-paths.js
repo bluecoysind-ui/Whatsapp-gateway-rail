@@ -272,6 +272,36 @@
 
 /**
  * @swagger
+ * /api/whatsapp/sessions/{sessionId}/pairing-code:
+ *   post:
+ *     tags: [Sessions]
+ *     summary: Request a phone-number pairing code
+ *     description: Alternative to scanning the QR. Enter the code in WhatsApp → Linked Devices → Link with phone number.
+ *     parameters:
+ *       - in: path
+ *         name: sessionId
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [phoneNumber]
+ *             properties:
+ *               phoneNumber:
+ *                 type: string
+ *                 example: "919876543210"
+ *                 description: WhatsApp number with country code, digits only
+ *     responses:
+ *       200:
+ *         description: Pairing code generated
+ */
+
+/**
+ * @swagger
  * /api/whatsapp/sessions/{sessionId}/qr/image:
  *   get:
  *     tags: [Sessions]

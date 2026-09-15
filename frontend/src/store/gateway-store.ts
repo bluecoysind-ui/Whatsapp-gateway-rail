@@ -8,6 +8,7 @@ import {
   fetchMessageMedia,
   getQr,
   listBulkJobs,
+  requestPairingCode as apiRequestPairingCode,
   listChats,
   listMessages,
   listSessions,
@@ -178,6 +179,10 @@ type State = {
   qrSession: string;
   qrSrc: string;
   qrExpiresAt: number | null;
+  pairingCode: string;
+  pairingPhone: string;
+  pairingExpiresAt: number | null;
+  pairingLoading: boolean;
   webhookSessionId: string;
   /** Session the proxy modal edits. */
   proxySessionId: string;
@@ -216,6 +221,7 @@ type State = {
   removeSession: (id: string) => Promise<void>;
   refreshQr: (id: string) => Promise<void>;
   watchQrSession: (id: string) => void;
+  requestPairingCode: (phoneNumber: string) => Promise<boolean>;
   addHook: (url: string, events: string[]) => Promise<void>;
   removeHook: (url: string) => Promise<void>;
   setBulkSession: (id: string) => void;
@@ -313,6 +319,10 @@ export const useGateway = create<State>((set, get) => ({
   qrSession: "",
   qrSrc: "",
   qrExpiresAt: null,
+  pairingCode: "",
+  pairingPhone: "",
+  pairingExpiresAt: null,
+  pairingLoading: false,
   webhookSessionId: "",
   proxySessionId: "",
   composer: "",
@@ -327,7 +337,7 @@ export const useGateway = create<State>((set, get) => ({
     try {
       const result = await listSessions();
       if (result.success && Array.isArray(result.data)) {
-        const sessions = result.data;
+        const sessions = result.data.filter((s) => s.status !== "qr_expired");
         const current = get().activeAccountId;
         const active =
           sessions.find((s) => s.sessionId === current && s.status === "connected") ??
@@ -388,7 +398,7 @@ export const useGateway = create<State>((set, get) => ({
     }
     if (!result.success || !Array.isArray(result.data)) return;
     const before = get().sessions;
-    const sessions = result.data;
+    const sessions = result.data.filter((s) => s.status !== "qr_expired");
     for (const s of sessions) {
       const line = describeStatusChange(
         before.find((b) => b.sessionId === s.sessionId),
@@ -697,7 +707,7 @@ export const useGateway = create<State>((set, get) => ({
       clearInterval(qrWatchTimer);
       qrWatchTimer = null;
     }
-    set({ overlay: null, qrSrc: "", qrExpiresAt: null });
+    set({ overlay: null, qrSrc: "", qrExpiresAt: null, pairingCode: "", pairingPhone: "", pairingExpiresAt: null, pairingLoading: false });
   },
 
   createSession: async (id, webhook, proxy) => {
@@ -737,6 +747,9 @@ export const useGateway = create<State>((set, get) => ({
       overlay: "qr",
       qrSession: id,
       qrSrc: "",
+      pairingCode: "",
+      pairingPhone: "",
+      pairingExpiresAt: null,
     }));
     get().pushEvent("connection", `Session ${id} created`);
     get().pushToast("success", "Scan QR to connect");
@@ -823,6 +836,9 @@ export const useGateway = create<State>((set, get) => ({
             qrSrc: result.data.qrCode,
             qrSession: id,
             qrExpiresAt: result.data.qrExpiresAt ?? null,
+            pairingCode: result.data.pairingCode ?? get().pairingCode,
+            pairingPhone: result.data.pairingPhone ?? get().pairingPhone,
+            pairingExpiresAt: result.data.pairingExpiresAt ?? get().pairingExpiresAt,
           });
           return;
         }
@@ -852,6 +868,13 @@ export const useGateway = create<State>((set, get) => ({
         if (qr.success && qr.data?.qrExpiresAt && qr.data.qrExpiresAt !== get().qrExpiresAt) {
           set({ qrExpiresAt: qr.data.qrExpiresAt });
         }
+        if (qr.success && qr.data?.pairingCode && qr.data.pairingCode !== get().pairingCode) {
+          set({
+            pairingCode: qr.data.pairingCode,
+            pairingPhone: qr.data.pairingPhone ?? get().pairingPhone,
+            pairingExpiresAt: qr.data.pairingExpiresAt ?? get().pairingExpiresAt,
+          });
+        }
         const sessions = list.success && Array.isArray(list.data) ? list.data : undefined;
         const status = sessions?.find((s) => s.sessionId === qrSession)?.status;
         if (status === "connected") {
@@ -864,17 +887,57 @@ export const useGateway = create<State>((set, get) => ({
           if (get().activeAccountId !== qrSession) get().selectAccount(qrSession);
           else await get().loadChats();
         } else if (status === "qr_expired") {
-          set((s) => ({ sessions: sessions ?? s.sessions }));
+          set((s) => ({
+            sessions: (sessions ?? s.sessions).filter((x) => x.sessionId !== qrSession && x.status !== "qr_expired"),
+          }));
           get().closeOverlay();
-          get().pushToast("error", "QR expired — session revoked. Reconnect for a new QR.");
-          get().pushEvent("error", `Session ${qrSession} QR expired`);
+          get().pushToast("error", "QR expired — session removed. Create a new session to link again.");
+          get().pushEvent("error", `Session ${qrSession} QR expired and was removed`);
         } else if (sessions) {
-          set({ sessions });
+          set({ sessions: sessions.filter((x) => x.status !== "qr_expired") });
         }
       } catch {
         /* gateway hiccup — retry on the next tick */
       }
     }, 2000);
+  },
+
+  requestPairingCode: async (phoneNumber) => {
+    const id = get().qrSession;
+    if (!id) {
+      get().pushToast("error", "No pairing session is open");
+      return false;
+    }
+    if (!get().live) {
+      get().pushToast("error", "Not connected to the gateway");
+      return false;
+    }
+    const digits = phoneNumber.replace(/\D/g, "");
+    if (digits.length < 11 || digits.length > 15) {
+      get().pushToast("error", "Enter the full number with country code (e.g. 919876543210)");
+      return false;
+    }
+    set({ pairingLoading: true });
+    try {
+      const result = await apiRequestPairingCode(id, digits);
+      if (!result.success || !result.data?.pairingCode) {
+        get().pushToast("error", result.message || "Could not get a pairing code");
+        return false;
+      }
+      set({
+        pairingCode: result.data.pairingCode,
+        pairingPhone: result.data.pairingPhone || digits,
+        pairingExpiresAt: result.data.pairingExpiresAt ?? null,
+      });
+      get().pushToast("success", "Enter this code in WhatsApp");
+      get().pushEvent("qr", `Pairing code generated for ${digits}`);
+      return true;
+    } catch {
+      get().pushToast("error", "Gateway unreachable — pairing code not requested");
+      return false;
+    } finally {
+      set({ pairingLoading: false });
+    }
   },
 
   addHook: async (url, events) => {
